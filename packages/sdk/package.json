@@ -1,0 +1,22 @@
+{
+  "name": "@kallpa/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Kallpa Finance - RWA Invoice Factoring and Multi-Investor Pooling on Soroban & Trustless Work",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist",
+    "test": "bun test"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "rwa",
+    "factoring",
+    "escrow",
+    "trustless-work"
+  ],
+  "author": "Carlos Murillo (Kallpa Labs)",
+  "license": "MIT"
+}

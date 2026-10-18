@@ -1,0 +1,15 @@
+# Rust
+/target
+Cargo.lock
+
+# Node / Bun
+node_modules
+dist
+.env
+.env.local
+.DS_Store
+
+# IDE
+.vscode
+.idea
+*.swp
