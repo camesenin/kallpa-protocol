@@ -171,3 +171,48 @@ fn test_refund_on_expired_deadline() {
     let bal_after = setup.token_client.balance(&setup.investor1);
     assert_eq!(bal_after - bal_before, contrib);
 }
+
+#[test]
+fn test_exact_zero_dust_telescoping_pro_rata() {
+    let setup = setup_test();
+    let investor3 = Address::generate(&setup.env);
+    setup.token_admin.mint(&investor3, &100_000_0000000);
+
+    let target = 10_000_0000000i128; // 10,000 USDC
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 1_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &target,
+        &deadline,
+        &min_contribution,
+    );
+
+    // 3 unequal contributors dividing by 3:
+    // Inv1: 3,333.3333333 USDC
+    // Inv2: 3,333.3333333 USDC
+    // Inv3: 3,333.3333334 USDC
+    // Total = 10,000.0000000 USDC
+    let c1 = 3_333_3333333i128;
+    let c2 = 3_333_3333333i128;
+    let c3 = 3_333_3333334i128;
+
+    setup.client.contribute(&setup.investor1, &c1);
+    setup.client.contribute(&setup.investor2, &c2);
+    setup.client.contribute(&investor3, &c3);
+
+    // Repayment with prime amount creating recurring fractions: 11,337.7777777 USDC
+    let repayment = 11_337_7777777i128;
+    setup.client.settle_repayment(&setup.payer, &repayment);
+
+    let p1 = setup.client.claim_return(&setup.investor1);
+    let p2 = setup.client.claim_return(&setup.investor2);
+    let p3 = setup.client.claim_return(&investor3);
+
+    // INVARIANT: sum of individual payouts MUST EXACTLY equal total repayment with ZERO dust residual
+    assert_eq!(p1 + p2 + p3, repayment);
+}
+

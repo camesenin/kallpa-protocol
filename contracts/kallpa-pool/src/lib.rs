@@ -20,7 +20,7 @@ pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
-    /// Initialize the factoring pool with immutable parameters.
+    /// Initialize the factoring/milestone pool with immutable parameters.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -58,7 +58,7 @@ impl KallpaPoolContract {
         Ok(())
     }
 
-    /// Contributor contributes USDC to the factoring pool.
+    /// Contributor contributes USDC to the pool.
     pub fn contribute(env: Env, investor: Address, amount: i128) -> Result<i128, Error> {
         investor.require_auth();
 
@@ -80,7 +80,6 @@ impl KallpaPoolContract {
 
         let now = env.ledger().timestamp();
         if now > config.deadline {
-            // Auto-transition to Refundable if deadline expired without reaching target
             env.storage().instance().set(&DataKey::State, &PoolState::Refundable);
             return Err(Error::DeadlinePassed);
         }
@@ -104,20 +103,20 @@ impl KallpaPoolContract {
             return Err(Error::CapacityExceeded);
         }
 
-        // Clamp contribution to exact remaining capacity
         let actual_contribution = if amount > remaining { remaining } else { amount };
 
-        // Pull funds from investor to pool contract
+        // Pull funds from contributor to pool contract
         let token_client = token::Client::new(&env, &config.asset);
         token_client.transfer(&investor, &env.current_contract_address(), &actual_contribution);
 
+        let cum_prior = total_collected;
         let new_total = total_collected
             .checked_add(actual_contribution)
             .ok_or(Error::MathOverflow)?;
 
         env.storage().instance().set(&DataKey::TotalCollected, &new_total);
 
-        // Update persistent investor position
+        // Update persistent contributor position with telescoping cumulative bounds
         let position_key = DataKey::Position(investor.clone());
         let mut position = env
             .storage()
@@ -126,6 +125,8 @@ impl KallpaPoolContract {
             .unwrap_or(Position {
                 investor: investor.clone(),
                 principal: 0,
+                cum_prior,
+                cum_after: new_total,
                 claimed: false,
             });
 
@@ -133,6 +134,7 @@ impl KallpaPoolContract {
             .principal
             .checked_add(actual_contribution)
             .ok_or(Error::MathOverflow)?;
+        position.cum_after = new_total;
 
         env.storage().persistent().set(&position_key, &position);
         env.storage().persistent().extend_ttl(
@@ -145,7 +147,6 @@ impl KallpaPoolContract {
         if new_total >= config.target_amount {
             env.storage().instance().set(&DataKey::State, &PoolState::Funded);
 
-            // Transfer the entire target amount to Trustless Work Escrow contract
             token_client.transfer(
                 &env.current_contract_address(),
                 &config.tw_escrow,
@@ -157,7 +158,7 @@ impl KallpaPoolContract {
         Ok(actual_contribution)
     }
 
-    /// Supplier/Debtor repays invoice principal + interest into the pool.
+    /// Payer / Escrow repays or returns funds into the pool upon settlement.
     pub fn settle_repayment(env: Env, payer: Address, amount: i128) -> Result<(), Error> {
         payer.require_auth();
 
@@ -198,7 +199,10 @@ impl KallpaPoolContract {
         Ok(())
     }
 
-    /// Investor claims their exact pro-rata return (principal + yield) after settlement.
+    /// Participant claims their exact pro-rata return.
+    /// Uses telescoping cumulative prefix allocation:
+    /// Payout_i = floor(CumAfter_i * Repaid / Target) - floor(CumPrior_i * Repaid / Target)
+    /// Guarantees that sum(Payout_i) == TotalRepaid with zero residual dust.
     pub fn claim_return(env: Env, investor: Address) -> Result<i128, Error> {
         investor.require_auth();
 
@@ -245,13 +249,22 @@ impl KallpaPoolContract {
             return Err(Error::InvalidAmount);
         }
 
-        // Exact pro-rata calculation: payout = (principal * total_repaid) / total_collected
-        let payout = position
-            .principal
+        // Exact telescoping prefix sum formula
+        let upper = position
+            .cum_after
             .checked_mul(total_repaid)
             .ok_or(Error::MathOverflow)?
             .checked_div(total_collected)
             .ok_or(Error::MathOverflow)?;
+
+        let lower = position
+            .cum_prior
+            .checked_mul(total_repaid)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(total_collected)
+            .ok_or(Error::MathOverflow)?;
+
+        let payout = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
 
         position.claimed = true;
         env.storage().persistent().set(&position_key, &position);

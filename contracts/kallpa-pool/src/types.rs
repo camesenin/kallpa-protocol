@@ -45,6 +45,8 @@ pub struct PoolConfig {
 pub struct Position {
     pub investor: Address,
     pub principal: i128,
+    pub cum_prior: i128,
+    pub cum_after: i128,
     pub claimed: bool,
 }
 
