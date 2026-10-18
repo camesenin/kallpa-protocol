@@ -32,8 +32,8 @@ flowchart TD
         A3["Participant N (USDC)"] -->|"Partial Contribution"| KP1
         KP1 -->|"Target Reached"| TW1["Trustless Work Escrow (Depositor: Kallpa)"]
         TW1 -->|"Milestone Approved"| DEV["Developer / Auditor (Beneficiary)"]
-        TW1 -.->|"Dispute Resolved"| KP1
-        KP1 -.->|"Refund on Dispute / Expiry"| A1
+        TW1 -.->|"Dispute Resolved (SEP-41 Return)"| KP1
+        KP1 -.->|"Refund on Dispute (sync_dispute_refund) / Expiry"| A1
     end
 
     subgraph Mode B: Syndicated Liquidity Advance (Illustrative)
@@ -52,9 +52,9 @@ flowchart TD
    - Strictly checked integer arithmetic (`checked_mul`, `checked_div`, `checked_add`) eliminating floating-point imprecision.
    - Formal state machine: `Open` → `Funded` → `Settled` (or auto-transition to `Refundable` on expired deadline).
    - Segregated storage design: Instance storage for global parameters; persistent storage with explicit TTL extensions (`extend_ttl`) for participant positions.
-   - Resource-bounded claims: Hard limit of 16 Deposit Slices per address with in-memory aggregation to guarantee execution stays well within Soroban CPU/memory metering limits.
+   - Resource-bounded claims: Planned Hard Cap of 16 Deposit Slices per address with contiguous adjacent expansion (Milestone 1), ensuring execution stays strictly within Soroban CPU/memory metering limits while preserving mathematical zero-dust telescoping sums.
 2. **Trustless Work Interoperability:**
-   - Pre-audited milestone escrow primitives downstream (`github.com/Trustless-Work/trustlesswork-smart-contract-stellar`).
+   - Milestone escrow primitives downstream (`github.com/Trustless-Work/trustlesswork-smart-contract-stellar`). Native Soroban `require_auth()` cross-contract invocation.
    - Eliminates custodial aggregation: funds remain on-chain at all times.
 3. **Exact Telescoping Pro-Rata Math (`@kallpa/sdk`):**
    - Algebraic telescoping prefix-sum identity:
@@ -122,7 +122,7 @@ bun test
 ## 👤 Maintainer & Lead Engineer
 
 - **Carlos Murillo** ([`@camesenin`](https://github.com/camesenin))
-  - Core contributor to Soroban and Stellar ecosystem protocols (Tansu DAO governance smart contracts, Boundless Builders infrastructure, Mercato, KindFi).
+  - Active contributor to Soroban and Stellar ecosystem protocols (Tansu DAO governance smart contracts, Boundless Builders infrastructure, Mercato, KindFi).
 
 ## 📄 License
 This project is licensed under the [MIT License](LICENSE).
