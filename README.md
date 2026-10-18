@@ -99,14 +99,14 @@ kallpa-protocol/
 ```bash
 cargo test --workspace
 ```
-*Current test suite: 3 passing tests (full lifecycle, deadline expiration refund, and zero-dust telescoping pro-rata invariant).*
+*Current test suite: 5 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, and escrow dispute refund).*
 
 ### 2. Run TypeScript SDK Tests
 ```bash
 cd packages/sdk
 bun test
 ```
-*Current test suite: 4 passing unit tests (pro-rata calculations, remaining capacity clamping, decimal precision).*
+*Current test suite: 5 passing unit tests (telescoping pro-rata math, 3-party asymmetric fractional repayments, capacity clamping, negative parsing, and boundary validation).*
 
 ---
 
