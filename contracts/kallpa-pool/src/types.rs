@@ -17,6 +17,8 @@ pub enum Error {
     NoPosition = 11,
     NotRefundable = 12,
     MathOverflow = 13,
+    MultipleDepositsNotAllowed = 14,
+    PoolNotDisputed = 15,
 }
 
 #[contracttype]
@@ -27,6 +29,7 @@ pub enum PoolState {
     Funded = 1,
     Settled = 2,
     Refundable = 3,
+    Disputed = 4,
 }
 
 #[contracttype]
@@ -35,6 +38,7 @@ pub struct PoolConfig {
     pub admin: Address,
     pub asset: Address,
     pub tw_escrow: Address,
+    pub payer: Address,
     pub target_amount: i128,
     pub deadline: u64,
     pub min_contribution: i128,

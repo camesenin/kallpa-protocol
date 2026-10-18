@@ -1,12 +1,13 @@
 /**
- * @kallpa/sdk - Official Client & Domain Logic for Kallpa Finance
- * Multi-investor RWA invoice factoring protocol on Soroban and Trustless Work EaaS.
+ * @kallpa/sdk - Client Domain Logic & Telescoping Math for Kallpa Protocol
+ * Multi-party capital pooling and zero-dust pro-rata settlement for Trustless Work escrows on Stellar & Soroban.
  */
 
 export interface PoolConfig {
   admin: string;
   asset: string;
   twEscrow: string;
+  payer: string;
   targetAmount: bigint;
   deadline: number;
   minContribution: bigint;
@@ -15,6 +16,8 @@ export interface PoolConfig {
 export interface InvestorPosition {
   investor: string;
   principal: bigint;
+  cumPrior: bigint;
+  cumAfter: bigint;
   claimed: boolean;
 }
 
@@ -23,34 +26,32 @@ export enum PoolState {
   Funded = 1,
   Settled = 2,
   Refundable = 3,
-}
-
-export interface InvoiceMetadata {
-  invoiceId: string;
-  supplierAddress: string;
-  debtorAddress: string;
-  faceValueUsdc: bigint;
-  advanceRateBps: number; // e.g. 8000 = 80%
-  discountFeeBps: number;  // e.g. 500 = 5% flat fee
-  dueDateTimestamp: number;
+  Disputed = 4,
 }
 
 /**
- * Calculates exact pro-rata entitlement of an investor upon invoice repayment.
- * Guaranteed deterministic integer math without precision loss or floating point residuals.
+ * Calculates exact pro-rata entitlement of a contributor upon settlement using
+ * algebraic telescoping prefix sums:
+ * Payout_i = floor(cumAfter * totalRepaid / totalCollected) - floor(cumPrior * totalRepaid / totalCollected)
+ *
+ * Guarantees zero residual dust and strict conservation of funds across all participants.
  */
-export function calculateProRataPayout(
-  principal: bigint,
+export function calculateTelescopingPayout(
+  cumPrior: bigint,
+  cumAfter: bigint,
   totalRepaid: bigint,
   totalCollected: bigint
 ): bigint {
   if (totalCollected <= 0n) {
     throw new Error("Total collected must be greater than zero");
   }
-  if (principal <= 0n) {
-    throw new Error("Principal must be greater than zero");
+  if (cumAfter < cumPrior) {
+    throw new Error("cumAfter must be greater than or equal to cumPrior");
   }
-  return (principal * totalRepaid) / totalCollected;
+
+  const upper = (cumAfter * totalRepaid) / totalCollected;
+  const lower = (cumPrior * totalRepaid) / totalCollected;
+  return upper - lower;
 }
 
 /**
@@ -80,7 +81,7 @@ export function validateContribution(
   if (remainingCapacity <= 0n) {
     return { valid: false, actualAmount: 0n, error: "Pool capacity is already full" };
   }
-  if (amount < minContribution && remainingCapacity >= minContribution) {
+  if (amount < minContribution) {
     return {
       valid: false,
       actualAmount: 0n,
@@ -109,12 +110,16 @@ export function formatUnits(amount: bigint, decimals: number = 7): string {
  * Parses a decimal string (e.g. "150.50") into a raw 7-decimal BigInt.
  */
 export function parseUnits(amountStr: string, decimals: number = 7): bigint {
-  const parts = amountStr.trim().split(".");
+  const cleanStr = amountStr.trim();
+  const isNegative = cleanStr.startsWith("-");
+  const unsignedStr = isNegative ? cleanStr.slice(1) : cleanStr;
+
+  const parts = unsignedStr.split(".");
   const intPart = BigInt(parts[0] || "0");
-  if (parts.length === 1) {
-    return intPart * (10n ** BigInt(decimals));
+  let val = intPart * (10n ** BigInt(decimals));
+  if (parts.length > 1) {
+    const fracPartStr = parts[1].slice(0, decimals).padEnd(decimals, "0");
+    val += BigInt(fracPartStr);
   }
-  const fracPartStr = parts[1].slice(0, decimals).padEnd(decimals, "0");
-  const fracPart = BigInt(fracPartStr);
-  return intPart * (10n ** BigInt(decimals)) + fracPart;
+  return isNegative ? -val : val;
 }

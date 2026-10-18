@@ -20,16 +20,19 @@ pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
-    /// Initialize the factoring/milestone pool with immutable parameters.
+    /// Initialize the milestone pool with immutable parameters.
     pub fn initialize(
         env: Env,
         admin: Address,
         asset: Address,
         tw_escrow: Address,
+        payer: Address,
         target_amount: i128,
         deadline: u64,
         min_contribution: i128,
     ) -> Result<(), Error> {
+        admin.require_auth();
+
         if env.storage().instance().has(&DataKey::Config) {
             return Err(Error::AlreadyInitialized);
         }
@@ -44,6 +47,7 @@ impl KallpaPoolContract {
             admin,
             asset,
             tw_escrow,
+            payer,
             target_amount,
             deadline,
             min_contribution,
@@ -59,6 +63,8 @@ impl KallpaPoolContract {
     }
 
     /// Contributor contributes USDC to the pool.
+    /// In Phase 0 prototype, accounts are limited to one contribution per address to guarantee exact zero-dust telescoping intervals.
+    /// Multi-slice non-contiguous deposits are planned for Milestone 1.
     pub fn contribute(env: Env, investor: Address, amount: i128) -> Result<i128, Error> {
         investor.require_auth();
 
@@ -80,8 +86,13 @@ impl KallpaPoolContract {
 
         let now = env.ledger().timestamp();
         if now > config.deadline {
-            env.storage().instance().set(&DataKey::State, &PoolState::Refundable);
             return Err(Error::DeadlinePassed);
+        }
+
+        // Prevent non-contiguous interval corruption in Phase 0 prototype
+        let position_key = DataKey::Position(investor.clone());
+        if env.storage().persistent().has(&position_key) {
+            return Err(Error::MultipleDepositsNotAllowed);
         }
 
         if amount < config.min_contribution {
@@ -116,25 +127,14 @@ impl KallpaPoolContract {
 
         env.storage().instance().set(&DataKey::TotalCollected, &new_total);
 
-        // Update persistent contributor position with telescoping cumulative bounds
-        let position_key = DataKey::Position(investor.clone());
-        let mut position = env
-            .storage()
-            .persistent()
-            .get(&position_key)
-            .unwrap_or(Position {
-                investor: investor.clone(),
-                principal: 0,
-                cum_prior,
-                cum_after: new_total,
-                claimed: false,
-            });
-
-        position.principal = position
-            .principal
-            .checked_add(actual_contribution)
-            .ok_or(Error::MathOverflow)?;
-        position.cum_after = new_total;
+        // Record immutable contributor position with telescoping cumulative bounds
+        let position = Position {
+            investor: investor.clone(),
+            principal: actual_contribution,
+            cum_prior,
+            cum_after: new_total,
+            claimed: false,
+        };
 
         env.storage().persistent().set(&position_key, &position);
         env.storage().persistent().extend_ttl(
@@ -158,7 +158,7 @@ impl KallpaPoolContract {
         Ok(actual_contribution)
     }
 
-    /// Payer / Escrow repays or returns funds into the pool upon settlement.
+    /// Authorized payer repays or returns funds into the pool upon settlement.
     pub fn settle_repayment(env: Env, payer: Address, amount: i128) -> Result<(), Error> {
         payer.require_auth();
 
@@ -167,6 +167,11 @@ impl KallpaPoolContract {
             .instance()
             .get(&DataKey::Config)
             .ok_or(Error::NotInitialized)?;
+
+        // Only the designated payer or admin can settle repayment
+        if payer != config.payer && payer != config.admin {
+            return Err(Error::Unauthorized);
+        }
 
         let state: PoolState = env
             .storage()
@@ -195,6 +200,43 @@ impl KallpaPoolContract {
         env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
         env.storage().instance().set(&DataKey::State, &PoolState::Settled);
 
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    /// Handle returned funds when an escrow dispute is resolved in favor of the pool.
+    pub fn handle_dispute_refund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        caller.require_auth();
+
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        // Only Trustless Work escrow contract or admin can trigger dispute return
+        if caller != config.tw_escrow && caller != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state != PoolState::Funded {
+            return Err(Error::PoolNotFunded);
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let token_client = token::Client::new(&env, &config.asset);
+        token_client.transfer(&caller, &env.current_contract_address(), &amount);
+
+        env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
@@ -303,7 +345,7 @@ impl KallpaPoolContract {
             env.storage().instance().set(&DataKey::State, &PoolState::Refundable);
         }
 
-        if state != PoolState::Refundable {
+        if state != PoolState::Refundable && state != PoolState::Disputed {
             return Err(Error::NotRefundable);
         }
 

@@ -78,6 +78,7 @@ fn test_successful_pool_lifecycle() {
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
+        &setup.payer,
         &target,
         &deadline,
         &min_contribution,
@@ -88,6 +89,7 @@ fn test_successful_pool_lifecycle() {
     assert_eq!(total, 0);
     assert_eq!(repaid, 0);
     assert_eq!(config.target_amount, target);
+    assert_eq!(config.payer, setup.payer);
 
     // 2. Investor 1 contributes 6,000 USDC (60%)
     let contrib1 = 6_000_0000000i128;
@@ -115,7 +117,7 @@ fn test_successful_pool_lifecycle() {
     let tw_balance = setup.token_client.balance(&setup.tw_escrow);
     assert_eq!(tw_balance, target);
 
-    // 4. Debtor / Payer repays invoice with 10% interest (11,000 USDC)
+    // 4. Authorized Payer repays invoice with 10% premium (11,000 USDC)
     let repayment = 11_000_0000000i128;
     setup.client.settle_repayment(&setup.payer, &repayment);
 
@@ -152,6 +154,7 @@ fn test_refund_on_expired_deadline() {
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
+        &setup.payer,
         &target,
         &deadline,
         &min_contribution,
@@ -186,16 +189,13 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
+        &setup.payer,
         &target,
         &deadline,
         &min_contribution,
     );
 
-    // 3 unequal contributors dividing by 3:
-    // Inv1: 3,333.3333333 USDC
-    // Inv2: 3,333.3333333 USDC
-    // Inv3: 3,333.3333334 USDC
-    // Total = 10,000.0000000 USDC
+    // 3 unequal contributors:
     let c1 = 3_333_3333333i128;
     let c2 = 3_333_3333333i128;
     let c3 = 3_333_3333334i128;
@@ -204,7 +204,7 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
     setup.client.contribute(&setup.investor2, &c2);
     setup.client.contribute(&investor3, &c3);
 
-    // Repayment with prime amount creating recurring fractions: 11,337.7777777 USDC
+    // Repayment with fractional cents: 11,337.7777777 USDC
     let repayment = 11_337_7777777i128;
     setup.client.settle_repayment(&setup.payer, &repayment);
 
@@ -214,5 +214,68 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
 
     // INVARIANT: sum of individual payouts MUST EXACTLY equal total repayment with ZERO dust residual
     assert_eq!(p1 + p2 + p3, repayment);
+}
+
+#[test]
+fn test_reject_multiple_deposits_per_address() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 100_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &2_000_0000000i128);
+
+    // Second contribution by same address must be rejected in Phase 0 prototype to protect telescoping invariants
+    let res = setup.client.try_contribute(&setup.investor1, &1_000_0000000i128);
+    assert_eq!(res, Err(Ok(Error::MultipleDepositsNotAllowed)));
+}
+
+#[test]
+fn test_dispute_refund_flow() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 100_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &deadline,
+        &min_contribution,
+    );
+
+    // Fully fund pool
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Funded);
+
+    // Escrow dispute arises and Trustless Work refunds the 10,000 USDC back to the pool
+    setup.token_admin.mint(&setup.tw_escrow, &10_000_0000000i128);
+    setup.client.handle_dispute_refund(&setup.tw_escrow, &target);
+
+    let (_, state_disputed, _, _) = setup.client.get_pool_info();
+    assert_eq!(state_disputed, PoolState::Disputed);
+
+    // Investors can withdraw their full deposits
+    let r1 = setup.client.refund(&setup.investor1);
+    assert_eq!(r1, 6_000_0000000i128);
+
+    let r2 = setup.client.refund(&setup.investor2);
+    assert_eq!(r2, 4_000_0000000i128);
 }
 
