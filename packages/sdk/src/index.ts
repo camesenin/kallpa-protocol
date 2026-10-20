@@ -30,8 +30,8 @@ export enum PoolState {
 }
 
 /**
- * Calculates exact pro-rata entitlement of a contributor upon settlement using
- * algebraic telescoping prefix sums:
+ * Calculates exact pro-rata entitlement of a contributor upon settlement or dispute refund
+ * using algebraic telescoping prefix sums:
  * Payout_i = floor(cumAfter * totalRepaid / totalCollected) - floor(cumPrior * totalRepaid / totalCollected)
  *
  * Guarantees zero residual dust and strict conservation of funds across all participants.
@@ -45,8 +45,17 @@ export function calculateTelescopingPayout(
   if (totalCollected <= 0n) {
     throw new Error("Total collected must be greater than zero");
   }
+  if (totalRepaid < 0n) {
+    throw new Error("Total repaid cannot be negative");
+  }
+  if (cumPrior < 0n) {
+    throw new Error("cumPrior cannot be negative");
+  }
   if (cumAfter < cumPrior) {
     throw new Error("cumAfter must be greater than or equal to cumPrior");
+  }
+  if (cumAfter > totalCollected) {
+    throw new Error("cumAfter cannot exceed totalCollected");
   }
 
   const upper = (cumAfter * totalRepaid) / totalCollected;
@@ -79,13 +88,13 @@ export function validateContribution(
     return { valid: false, actualAmount: 0n, error: "Contribution amount must be positive" };
   }
   if (remainingCapacity <= 0n) {
-    return { valid: false, actualAmount: 0n, error: "Pool capacity is already full" };
+    return { valid: false, actualAmount: 0n, error: "Pool capacity has been fully reached" };
   }
   if (amount < minContribution) {
     return {
       valid: false,
       actualAmount: 0n,
-      error: `Contribution below minimum allowed (${minContribution.toString()})`,
+      error: `Contribution is below minimum ticket (${minContribution.toString()})`,
     };
   }
 
@@ -94,32 +103,50 @@ export function validateContribution(
 }
 
 /**
- * Formats a raw 7-decimal Soroban integer (e.g. 10_0000000) to human readable string (10.00 USDC).
+ * Format stroops (or base units with given decimals) to human-readable decimal string.
  */
-export function formatUnits(amount: bigint, decimals: number = 7): string {
-  const isNegative = amount < 0n;
-  const absAmount = isNegative ? -amount : amount;
+export function formatUnits(value: bigint, decimals: number = 7): string {
+  const isNegative = value < 0n;
+  const absValue = isNegative ? -value : value;
   const divisor = 10n ** BigInt(decimals);
-  const integerPart = absAmount / divisor;
-  const fractionalPart = absAmount % divisor;
-  const paddedFractional = fractionalPart.toString().padStart(decimals, "0");
-  return `${isNegative ? "-" : ""}${integerPart.toString()}.${paddedFractional}`;
+  const integerPart = absValue / divisor;
+  const remainder = absValue % divisor;
+
+  if (remainder === 0n) {
+    return `${isNegative ? "-" : ""}${integerPart.toString()}`;
+  }
+
+  const paddedFraction = remainder.toString().padStart(decimals, "0").replace(/0+$/, "");
+  return `${isNegative ? "-" : ""}${integerPart.toString()}.${paddedFraction}`;
 }
 
 /**
- * Parses a decimal string (e.g. "150.50") into a raw 7-decimal BigInt.
+ * Parse a human decimal string into base units (e.g. stroops for USDC with 7 decimals).
+ * Strictly validates decimal format and forbids extraneous dots or invalid characters.
  */
-export function parseUnits(amountStr: string, decimals: number = 7): bigint {
-  const cleanStr = amountStr.trim();
-  const isNegative = cleanStr.startsWith("-");
-  const unsignedStr = isNegative ? cleanStr.slice(1) : cleanStr;
-
-  const parts = unsignedStr.split(".");
-  const intPart = BigInt(parts[0] || "0");
-  let val = intPart * (10n ** BigInt(decimals));
-  if (parts.length > 1) {
-    const fracPartStr = parts[1].slice(0, decimals).padEnd(decimals, "0");
-    val += BigInt(fracPartStr);
+export function parseUnits(value: string, decimals: number = 7): bigint {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error("Cannot parse empty string into units");
   }
-  return isNegative ? -val : val;
+
+  // Strict regex: optional sign, digits, optional single dot followed by digits
+  const match = /^([+-])?(\d+)(?:\.(\d+))?$/.exec(trimmed);
+  if (!match) {
+    throw new Error(`Invalid decimal format: "${value}"`);
+  }
+
+  const sign = match[1] === "-" ? -1n : 1n;
+  const intPart = BigInt(match[2]);
+  const fractionStr = match[3] || "";
+
+  if (fractionStr.length > decimals) {
+    throw new Error(`Fractional digits exceed precision limit (${decimals})`);
+  }
+
+  const paddedFraction = fractionStr.padEnd(decimals, "0");
+  const fracPart = BigInt(paddedFraction);
+  const total = intPart * (10n ** BigInt(decimals)) + fracPart;
+
+  return total * sign;
 }

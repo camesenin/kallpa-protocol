@@ -15,6 +15,9 @@ const INSTANCE_LIFETIME_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
 const PERSISTENT_BUMP_AMOUNT: u32 = 60 * DAY_IN_LEDGERS;
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 14 * DAY_IN_LEDGERS;
 
+// Maximum intermediate multiplication cap to guarantee i128 intermediate products never overflow
+const MAX_MONETARY_CAP: i128 = 10_000_000_000_000_000_000i128; // 10^19 stroops (1 trillion USDC)
+
 #[contract]
 pub struct KallpaPoolContract;
 
@@ -36,7 +39,7 @@ impl KallpaPoolContract {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(Error::AlreadyInitialized);
         }
-        if target_amount <= 0 || min_contribution <= 0 || min_contribution > target_amount {
+        if target_amount <= 0 || target_amount > MAX_MONETARY_CAP || min_contribution <= 0 || min_contribution > target_amount {
             return Err(Error::InvalidAmount);
         }
         if deadline <= env.ledger().timestamp() {
@@ -183,7 +186,7 @@ impl KallpaPoolContract {
             return Err(Error::PoolNotFunded);
         }
 
-        if amount <= 0 {
+        if amount <= 0 || amount > MAX_MONETARY_CAP {
             return Err(Error::InvalidAmount);
         }
 
@@ -205,6 +208,7 @@ impl KallpaPoolContract {
     }
 
     /// Handle returned funds when an escrow dispute is resolved in favor of the pool.
+    /// Supports partial returns, full returns, or zero return (null recovery closure).
     pub fn handle_dispute_refund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
         caller.require_auth();
 
@@ -229,19 +233,23 @@ impl KallpaPoolContract {
             return Err(Error::PoolNotFunded);
         }
 
-        if amount <= 0 {
+        if amount < 0 || amount > MAX_MONETARY_CAP {
             return Err(Error::InvalidAmount);
         }
 
-        let token_client = token::Client::new(&env, &config.asset);
-        token_client.transfer(&caller, &env.current_contract_address(), &amount);
+        if amount > 0 {
+            let token_client = token::Client::new(&env, &config.asset);
+            token_client.transfer(&caller, &env.current_contract_address(), &amount);
+        }
 
+        // Store refunded dispute balance into TotalRepaid for exact telescoping claims
+        env.storage().instance().set(&DataKey::TotalRepaid, &amount);
         env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
 
-    /// Participant claims their exact pro-rata return.
+    /// Participant claims their exact pro-rata return in Settled or Disputed state.
     /// Uses telescoping cumulative prefix allocation:
     /// Payout_i = floor(CumAfter_i * Repaid / Target) - floor(CumPrior_i * Repaid / Target)
     /// Guarantees that sum(Payout_i) == TotalRepaid with zero residual dust.
@@ -260,7 +268,8 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        if state != PoolState::Settled {
+        // Claims are accessible both on Settled and Disputed state (exact pro-rata refund of recovered funds)
+        if state != PoolState::Settled && state != PoolState::Disputed {
             return Err(Error::PoolNotSettled);
         }
 
@@ -291,7 +300,7 @@ impl KallpaPoolContract {
             return Err(Error::InvalidAmount);
         }
 
-        // Exact telescoping prefix sum formula
+        // Exact telescoping prefix sum formula (with checked intermediate math)
         let upper = position
             .cum_after
             .checked_mul(total_repaid)
@@ -308,7 +317,9 @@ impl KallpaPoolContract {
 
         let payout = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
 
+        // Check-Effects-Interactions: update position before token transfer
         position.claimed = true;
+        position.principal = 0;
         env.storage().persistent().set(&position_key, &position);
         env.storage().persistent().extend_ttl(
             &position_key,
@@ -316,14 +327,16 @@ impl KallpaPoolContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        let token_client = token::Client::new(&env, &config.asset);
-        token_client.transfer(&env.current_contract_address(), &investor, &payout);
+        if payout > 0 {
+            let token_client = token::Client::new(&env, &config.asset);
+            token_client.transfer(&env.current_contract_address(), &investor, &payout);
+        }
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(payout)
     }
 
-    /// Refund contribution if pool deadline expired without reaching target.
+    /// Refund contribution strictly when pool deadline expired without reaching target.
     pub fn refund(env: Env, investor: Address) -> Result<i128, Error> {
         investor.require_auth();
 
@@ -345,7 +358,7 @@ impl KallpaPoolContract {
             env.storage().instance().set(&DataKey::State, &PoolState::Refundable);
         }
 
-        if state != PoolState::Refundable && state != PoolState::Disputed {
+        if state != PoolState::Refundable {
             return Err(Error::NotRefundable);
         }
 
@@ -365,9 +378,15 @@ impl KallpaPoolContract {
             return Err(Error::InvalidAmount);
         }
 
+        // Check-Effects-Interactions: mark claimed & bump TTL before external transfer
         position.claimed = true;
         position.principal = 0;
         env.storage().persistent().set(&position_key, &position);
+        env.storage().persistent().extend_ttl(
+            &position_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let token_client = token::Client::new(&env, &config.asset);
         token_client.transfer(&env.current_contract_address(), &investor, &refund_amount);
