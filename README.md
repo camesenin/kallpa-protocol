@@ -15,6 +15,16 @@
 
 ---
 
+## 🌐 Deployed Testnet Contract
+
+| Network | Contract ID | Explorer / Stellar Lab |
+| :--- | :--- | :--- |
+| **Stellar Testnet** | CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX | [Stellar.Expert](https://stellar.expert/explorer/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) · [Stellar Lab](https://lab.stellar.org/r/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) |
+| **Deployer** | GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E | [Stellar.Expert](https://stellar.expert/explorer/testnet/account/GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E) |
+| **WASM Hash** | c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de | Protocol 22 / Soroban v28 |
+
+---
+
 ## ⚡ Overview & Ecosystem Problem
 
 **Kallpa Protocol** is an open-source Soroban smart contract primitive designed to enable **collective multi-party capital aggregation and deterministic zero-dust pro-rata settlement** for **Trustless Work** escrows on the Stellar network.
