@@ -271,11 +271,11 @@ fn test_dispute_refund_flow() {
     let (_, state_disputed, _, _) = setup.client.get_pool_info();
     assert_eq!(state_disputed, PoolState::Disputed);
 
-    // Investors can withdraw their full deposits
-    let r1 = setup.client.refund(&setup.investor1);
+    // In Disputed state, investors claim their pro-rata of the returned escrow funds via claim_return
+    let r1 = setup.client.claim_return(&setup.investor1);
     assert_eq!(r1, 6_000_0000000i128);
 
-    let r2 = setup.client.refund(&setup.investor2);
+    let r2 = setup.client.claim_return(&setup.investor2);
     assert_eq!(r2, 4_000_0000000i128);
 }
 
