@@ -182,7 +182,8 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        if state != PoolState::Funded {
+        // Allow repayments in Funded or Settled state to support multi-tranche repayments
+        if state != PoolState::Funded && state != PoolState::Settled {
             return Err(Error::PoolNotFunded);
         }
 
@@ -201,8 +202,42 @@ impl KallpaPoolContract {
 
         let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
         env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
-        env.storage().instance().set(&DataKey::State, &PoolState::Settled);
 
+        // Once at least the principal target is reached, pool moves to Settled
+        if new_repaid >= config.target_amount {
+            env.storage().instance().set(&DataKey::State, &PoolState::Settled);
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(())
+    }
+
+    /// Admin can explicitly declare the pool Settled if repayment was partial or compromised,
+    /// opening the pro-rata recovery claim flow for investors without blocking.
+    pub fn declare_settled(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        if admin != config.admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state != PoolState::Funded {
+            return Err(Error::PoolNotFunded);
+        }
+
+        env.storage().instance().set(&DataKey::State, &PoolState::Settled);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
@@ -242,8 +277,16 @@ impl KallpaPoolContract {
             token_client.transfer(&caller, &env.current_contract_address(), &amount);
         }
 
-        // Store refunded dispute balance into TotalRepaid for exact telescoping claims
-        env.storage().instance().set(&DataKey::TotalRepaid, &amount);
+        let total_repaid: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalRepaid)
+            .unwrap_or(0);
+
+        let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
+
+        // Store accumulated refunded dispute balance into TotalRepaid for exact telescoping claims
+        env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
         env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())

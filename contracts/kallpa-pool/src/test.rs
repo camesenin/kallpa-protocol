@@ -279,3 +279,109 @@ fn test_dispute_refund_flow() {
     assert_eq!(r2, 4_000_0000000i128);
 }
 
+
+#[test]
+fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128; // 10,000 USDC
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 100_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &deadline,
+        &min_contribution,
+    );
+
+    // Fully fund pool: inv1 = 60%, inv2 = 40%
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Funded);
+
+    // Payer sends a small 1 USDC partial repayment
+    let dust = 1_0000000i128; // 1 USDC
+    setup.client.settle_repayment(&setup.payer, &dust);
+
+    // Pool remains in Funded state, NOT Settled, preventing premature closure
+    let (_, state_after_dust, _, repaid_1) = setup.client.get_pool_info();
+    assert_eq!(state_after_dust, PoolState::Funded);
+    assert_eq!(repaid_1, dust);
+
+    // Investors cannot prematurely claim dust
+    let claim_res = setup.client.try_claim_return(&setup.investor1);
+    assert_eq!(claim_res.is_err(), true);
+
+    // Payer sends second tranche: 4,000 USDC
+    let tranche_2 = 4_000_0000000i128;
+    setup.client.settle_repayment(&setup.payer, &tranche_2);
+    let (_, state_tranche_2, _, repaid_2) = setup.client.get_pool_info();
+    assert_eq!(state_tranche_2, PoolState::Funded);
+    assert_eq!(repaid_2, dust + tranche_2);
+
+    // Payer completes full repayment with yield (6,999 USDC, total = 11,000 USDC)
+    let tranche_3 = 6_999_0000000i128;
+    setup.client.settle_repayment(&setup.payer, &tranche_3);
+
+    let (_, state_final, _, total_repaid) = setup.client.get_pool_info();
+    assert_eq!(state_final, PoolState::Settled);
+    assert_eq!(total_repaid, 11_000_0000000i128);
+
+    // Claims open and allocate exact pro-rata
+    let payout1 = setup.client.claim_return(&setup.investor1);
+    assert_eq!(payout1, 6_600_0000000i128);
+
+    let payout2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(payout2, 4_400_0000000i128);
+
+    assert_eq!(payout1 + payout2, 11_000_0000000i128);
+}
+
+#[test]
+fn test_admin_declare_settled_on_partial_repayment() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 100_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    // Payer only manages to repay 5,000 USDC (50% recovery)
+    let partial = 5_000_0000000i128;
+    setup.client.settle_repayment(&setup.payer, &partial);
+
+    let (_, state_funded, _, _) = setup.client.get_pool_info();
+    assert_eq!(state_funded, PoolState::Funded);
+
+    // Admin declares pool settled to release recovery funds to investors
+    setup.client.declare_settled(&setup.admin);
+
+    let (_, state_settled, _, total_repaid) = setup.client.get_pool_info();
+    assert_eq!(state_settled, PoolState::Settled);
+    assert_eq!(total_repaid, partial);
+
+    // Investors claim exact pro-rata of partial recovery
+    let p1 = setup.client.claim_return(&setup.investor1);
+    assert_eq!(p1, 3_000_0000000i128); // 60% of 5,000
+
+    let p2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(p2, 2_000_0000000i128); // 40% of 5,000
+
+    assert_eq!(p1 + p2, partial);
+}
