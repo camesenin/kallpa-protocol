@@ -1,6 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { KallpaKeeperDaemon, type KeeperConfig } from "./index";
-import { Keypair, xdr, Address } from "@stellar/stellar-sdk";
+import { Keypair, xdr, Address, SorobanDataBuilder } from "@stellar/stellar-sdk";
 
 describe("@kallpa/keeper", () => {
   const dummyKey = Keypair.random();
@@ -11,6 +11,9 @@ describe("@kallpa/keeper", () => {
     poolContractIds: ["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"],
     maxTranchesPerBatch: 25,
     minSponsorReserveStroops: 50_000_000n, // 5 XLM
+    maxFeePerTxStroops: 2_000_000n, // 0.2 XLM
+    maxSweepBudgetStroops: 10_000_000n, // 1 XLM
+    maxZeroPayoutTranchesPerCycle: 5,
   };
 
   it("initializes successfully with valid configuration", () => {
@@ -22,27 +25,22 @@ describe("@kallpa/keeper", () => {
     const daemon = new KallpaKeeperDaemon(dummyConfig);
     const mockContract = {} as any;
 
-    // Test rejection of non-integers
     expect(daemon.disburseSecondaryRecovery(mockContract, "GAAA", 1.5)).rejects.toThrow(
       "Must be an integer between 1 and 50"
     );
 
-    // Test rejection of 0
     expect(daemon.disburseSecondaryRecovery(mockContract, "GAAA", 0)).rejects.toThrow(
       "Must be an integer between 1 and 50"
     );
 
-    // Test rejection of > 50
     expect(daemon.disburseSecondaryRecovery(mockContract, "GAAA", 51)).rejects.toThrow(
       "Must be an integer between 1 and 50"
     );
 
-    // Test rejection of negative
     expect(daemon.disburseSecondaryRecovery(mockContract, "GAAA", -5)).rejects.toThrow(
       "Must be an integer between 1 and 50"
     );
 
-    // Test rejection of NaN
     expect(daemon.disburseSecondaryRecovery(mockContract, "GAAA", NaN)).rejects.toThrow(
       "Must be an integer between 1 and 50"
     );
@@ -82,10 +80,10 @@ describe("@kallpa/keeper", () => {
     );
     expect(isExhausted).toBe(true);
 
-    const result = await (daemon as any).executePermissionlessCall(
+    const result = await daemon.disburseSecondaryRecovery(
       realContract,
-      "claim_secondary_recovery",
-      [new Address(investor).toScVal()]
+      investor,
+      25
     );
     expect(result).toBeNull();
   });
@@ -123,5 +121,73 @@ describe("@kallpa/keeper", () => {
     );
     // Must NOT be exhausted: cursor must advance!
     expect(isExhausted).toBe(false);
+  });
+
+  it("enforces maxFeePerTxStroops policy: rejects envelopes exceeding per-tx budget", async () => {
+    const tightConfig: KeeperConfig = {
+      ...dummyConfig,
+      maxFeePerTxStroops: 50_000n, // Strict 0.005 XLM limit (below base inclusion 100_000)
+    };
+    const daemon = new KallpaKeeperDaemon(tightConfig);
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    (daemon as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => ({
+        minResourceFee: "0",
+        results: [
+          {
+            auth: [],
+            xdr: null,
+          },
+        ],
+        transactionData: new SorobanDataBuilder().build(),
+      }),
+    };
+
+    const realContract = new Contract(dummyConfig.poolContractIds[0]);
+    expect(
+      daemon.disburseClaimReturn(realContract, Keypair.random().publicKey())
+    ).rejects.toThrow("Envelope fee exceeds maximum allowable per-transaction policy");
+  });
+
+  it("enforces cumulative maxSweepBudgetStroops in runSweepCycle", async () => {
+    const tightSweepConfig: KeeperConfig = {
+      ...dummyConfig,
+      maxSweepBudgetStroops: 200_000n, // Only enough for 1 transaction
+    };
+    const daemon = new KallpaKeeperDaemon(tightSweepConfig);
+    const poolId = tightSweepConfig.poolContractIds[0];
+
+    // Mock solvency
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    // Mock disburseClaimReturnWithReceipt
+    let callCount = 0;
+    (daemon as any).disburseClaimReturnWithReceipt = async () => {
+      callCount++;
+      return { txHash: "mockHash" + callCount, feeSpentStroops: 200_000n };
+    };
+
+    const targets = new Map([
+      [
+        poolId,
+        [
+          { investor: Keypair.random().publicKey(), action: "claim_return" as const },
+          { investor: Keypair.random().publicKey(), action: "claim_return" as const },
+          { investor: Keypair.random().publicKey(), action: "claim_return" as const },
+        ],
+      ],
+    ]);
+
+    const result = await daemon.runSweepCycle(targets);
+    expect(callCount).toBe(1); // Stopped after first tx reached cumulative budget!
+    expect(result.processed).toBe(1);
+    expect(result.totalFeeSpentStroops).toBe(200_000n);
   });
 });

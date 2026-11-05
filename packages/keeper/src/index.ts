@@ -23,7 +23,10 @@ export interface KeeperConfig {
   sponsorSecret: string;
   poolContractIds: string[];
   maxTranchesPerBatch: number;
-  minSponsorReserveStroops: bigint; // e.g. 50_000_000n (5 XLM safety threshold in stroops)
+  minSponsorReserveStroops: bigint; // e.g. 50_000_000n (5 XLM safety cushion threshold)
+  maxFeePerTxStroops?: bigint; // Maximum fee willing to pay per single envelope (e.g. 2_000_000n = 0.2 XLM)
+  maxSweepBudgetStroops?: bigint; // Maximum cumulative spend per single sweep cycle (e.g. 20_000_000n = 2 XLM)
+  maxZeroPayoutTranchesPerCycle?: number; // Maximum zero-payout advancement tranches permitted per cycle to bound unmonetized subsidies
 }
 
 export interface InvestorClaimTarget {
@@ -106,10 +109,14 @@ export class KallpaKeeperDaemon {
    */
   async runSweepCycle(
     targetsByPool: Map<string, InvestorClaimTarget[]>
-  ): Promise<{ processed: number; errors: number; skippedForLowFunds: boolean; skippedZeroPayout: number }> {
+  ): Promise<{ processed: number; errors: number; skippedForLowFunds: boolean; skippedZeroPayout: number; totalFeeSpentStroops: bigint }> {
     let processed = 0;
     let errors = 0;
     let skippedZeroPayout = 0;
+    let totalFeeSpentStroops = 0n;
+
+    const maxSweepBudget = this.config.maxSweepBudgetStroops ?? 50_000_000n; // Default 5 XLM ceiling per cycle
+    const maxZeroPayouts = this.config.maxZeroPayoutTranchesPerCycle ?? 100; // Bound unmonetized advancement subsidies
 
     for (const poolId of this.config.poolContractIds) {
       const targets = targetsByPool.get(poolId) || [];
@@ -119,25 +126,37 @@ export class KallpaKeeperDaemon {
         const solvency = await this.checkSponsorSolvency();
         if (!solvency.solvent) {
           console.warn(`Sponsor reserve low (${solvency.availableStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
-          return { processed, errors, skippedForLowFunds: true, skippedZeroPayout };
+          return { processed, errors, skippedForLowFunds: true, skippedZeroPayout, totalFeeSpentStroops };
+        }
+
+        // Check cumulative cycle budget ceiling
+        if (totalFeeSpentStroops >= maxSweepBudget) {
+          console.warn(`Cumulative sweep budget ceiling reached (${totalFeeSpentStroops} >= ${maxSweepBudget} stroops). Pausing cycle.`);
+          return { processed, errors, skippedForLowFunds: false, skippedZeroPayout, totalFeeSpentStroops };
         }
 
         try {
-          let txHash: string | null = null;
+          let result: { txHash: string | null; feeSpentStroops: bigint } = { txHash: null, feeSpentStroops: 0n };
           if (target.action === "claim_return") {
-            txHash = await this.disburseClaimReturn(poolContract, target.investor);
+            result = await this.disburseClaimReturnWithReceipt(poolContract, target.investor);
           } else if (target.action === "refund") {
-            txHash = await this.disburseRefund(poolContract, target.investor);
+            result = await this.disburseRefundWithReceipt(poolContract, target.investor);
           } else if (target.action === "claim_secondary") {
+            if (skippedZeroPayout >= maxZeroPayouts) {
+              console.warn(`Max zero payout subsidized advancements reached (${skippedZeroPayout} >= ${maxZeroPayouts}).`);
+              continue;
+            }
             const tranches = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
-            txHash = await this.disburseSecondaryRecovery(
+            result = await this.disburseSecondaryRecoveryWithReceipt(
               poolContract,
               target.investor,
               tranches
             );
           }
 
-          if (txHash === null) {
+          totalFeeSpentStroops += result.feeSpentStroops;
+
+          if (result.txHash === null) {
             skippedZeroPayout++;
           } else {
             processed++;
@@ -149,13 +168,18 @@ export class KallpaKeeperDaemon {
       }
     }
 
-    return { processed, errors, skippedForLowFunds: false, skippedZeroPayout };
+    return { processed, errors, skippedForLowFunds: false, skippedZeroPayout, totalFeeSpentStroops };
   }
 
   /**
    * Route 1: Disburse primary claim_return
    */
   async disburseClaimReturn(poolContract: Contract, investor: string): Promise<string | null> {
+    const res = await this.disburseClaimReturnWithReceipt(poolContract, investor);
+    return res.txHash;
+  }
+
+  async disburseClaimReturnWithReceipt(poolContract: Contract, investor: string): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
     return this.executePermissionlessCall(poolContract, "claim_return", [
       new Address(investor).toScVal(),
     ]);
@@ -165,6 +189,11 @@ export class KallpaKeeperDaemon {
    * Route 2: Disburse refund on expired pool
    */
   async disburseRefund(poolContract: Contract, investor: string): Promise<string | null> {
+    const res = await this.disburseRefundWithReceipt(poolContract, investor);
+    return res.txHash;
+  }
+
+  async disburseRefundWithReceipt(poolContract: Contract, investor: string): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
     return this.executePermissionlessCall(poolContract, "refund", [
       new Address(investor).toScVal(),
     ]);
@@ -179,6 +208,15 @@ export class KallpaKeeperDaemon {
     investor: string,
     maxTranches: number
   ): Promise<string | null> {
+    const res = await this.disburseSecondaryRecoveryWithReceipt(poolContract, investor, maxTranches);
+    return res.txHash;
+  }
+
+  async disburseSecondaryRecoveryWithReceipt(
+    poolContract: Contract,
+    investor: string,
+    maxTranches: number
+  ): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
     if (typeof maxTranches !== "number" || !Number.isInteger(maxTranches) || maxTranches < 1 || maxTranches > 50) {
       throw new Error(`Invalid maxTranches: ${maxTranches}. Must be an integer between 1 and 50.`);
     }
@@ -236,7 +274,7 @@ export class KallpaKeeperDaemon {
     poolContract: Contract,
     method: string,
     args: xdr.ScVal[]
-  ): Promise<string | null> {
+  ): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
     const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
     const baseInclusionFee = 100000n; // 0.01 XLM base inclusion fee
 
@@ -261,7 +299,7 @@ export class KallpaKeeperDaemon {
     if (method === "claim_secondary_recovery" && args.length > 0) {
       const isExhausted = await this.isSecondaryClaimExhausted(poolContract, args[0]);
       if (isExhausted) {
-        return null;
+        return { txHash: null, feeSpentStroops: 0n };
       }
     }
     let preparedTx = rpc.assembleTransaction(tx, simRes).build();
@@ -320,8 +358,14 @@ export class KallpaKeeperDaemon {
       preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 
-    // 3. Strict definitive envelope budget check:
+    // 3. Strict definitive envelope budget check & per-tx fee policy:
     const definitiveEnvelopeFee = BigInt(preparedTx.fee);
+    const maxFeeLimit = this.config.maxFeePerTxStroops ?? 5_000_000n; // 0.5 XLM default max fee ceiling
+    if (definitiveEnvelopeFee > maxFeeLimit) {
+      throw new Error(
+        `Envelope fee exceeds maximum allowable per-transaction policy: fee ${definitiveEnvelopeFee} > maxFeeLimit ${maxFeeLimit}`
+      );
+    }
     const preSendSolvency = await this.checkSponsorSolvency();
     if (preSendSolvency.availableStroops < definitiveEnvelopeFee + this.config.minSponsorReserveStroops) {
       throw new Error(
@@ -337,7 +381,7 @@ export class KallpaKeeperDaemon {
     }
 
     await this.waitForConfirmation(sendRes.hash);
-    return sendRes.hash;
+    return { txHash: sendRes.hash, feeSpentStroops: definitiveEnvelopeFee };
   }
 
   /**
