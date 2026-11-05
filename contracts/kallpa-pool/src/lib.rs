@@ -658,7 +658,51 @@ impl KallpaPoolContract {
     }
 
     /// Read current pool configuration and status.
-    pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Error> {
+        /// Permissionless closure of pending sub-threshold recovery buffer:
+    /// Any contributor, keeper or admin can flush whatever residual amount remains in
+    /// DataKey::PendingSecondaryBuffer into a final discrete secondary tranche,
+    /// guaranteeing that zero funds are locked even if incoming recovery is under 1.0 USDC.
+    pub fn flush_secondary_buffer(env: Env, caller: Address) -> Result<i128, Error> {
+        caller.require_auth();
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state != PoolState::Settled && state != PoolState::Disputed {
+            return Err(Error::PoolNotSettled);
+        }
+
+        let pending: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSecondaryBuffer)
+            .unwrap_or(0);
+
+        if pending <= 0 {
+            return Ok(0);
+        }
+
+        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecondaryTrancheCount)
+            .unwrap_or(0);
+        let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+        env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+        let tranche_key = DataKey::SecondaryTranche(new_count);
+        env.storage().persistent().set(&tranche_key, &pending);
+        env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        Ok(pending)
+    }
+
+pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Error> {
         let config: PoolConfig = env
             .storage()
             .instance()

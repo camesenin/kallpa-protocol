@@ -805,3 +805,58 @@ fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
     // Verify Kallpa Pool contract balance after all claims: exactly 0 residual dust!
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
+
+
+#[test]
+fn test_flush_secondary_buffer_prevents_fund_lockup() {
+    // Tests that sub-threshold residual amounts in PendingSecondaryBuffer (e.g. 0.5 USDC = 5_000_000 stroops)
+    // can be flushed permissionlessly into a discrete tranche and claimed completely by investors with zero lockup!
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    // Borrower repays 10,000.5 USDC (obligation = 10,000 USDC, surplus = 0.5 USDC = 5_000_000 stroops)
+    // Settle_repayment settles pool and routes 0.5 USDC to PendingSecondaryBuffer
+    setup.client.settle_repayment(&setup.payer, &10_000_5000000i128);
+
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Settled);
+
+    // Primary claims
+    assert_eq!(setup.client.claim_return(&setup.investor1), 6_000_0000000i128);
+    assert_eq!(setup.client.claim_return(&setup.investor2), 4_000_0000000i128);
+
+    // No further repayments ever arrive. Contributor 2 calls flush_secondary_buffer permissionlessly
+    let flushed = setup.client.flush_secondary_buffer(&setup.investor2);
+    assert_eq!(flushed, 5_000_000i128); // Exactly 0.5 USDC flushed into Tranche #1
+
+    // Investors claim from the flushed tranche:
+    // 60% of 5_000_000 = 3_000_000 stroops
+    // 40% of 5_000_000 = 2_000_000 stroops
+    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(sec1, 3_000_000i128);
+    assert_eq!(sec2, 2_000_000i128);
+    assert_eq!(sec1 + sec2, 5_000_000i128);
+
+    // Exactly zero residual funds locked in the contract!
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+}
