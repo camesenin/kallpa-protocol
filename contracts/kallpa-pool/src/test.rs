@@ -1303,4 +1303,44 @@ fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_au
     // Replay refund is rejected
     let res_double_rf = setup.client.try_refund(&setup.investor1);
     assert_eq!(res_double_rf, Err(Ok(Error::AlreadyClaimed)));
+
+    // 2. Setup pool for secondary recovery testing
+    let setup2 = setup_test();
+    setup2.client.initialize(
+        &setup2.admin,
+        &setup2.token_addr,
+        &setup2.tw_escrow,
+        &setup2.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Fully fund pool
+    setup2.client.contribute(&setup2.investor1, &600_0000000i128);
+    setup2.client.contribute(&setup2.investor2, &400_0000000i128);
+
+    // Initial partial settlement: 500 USDC
+    setup2.token_admin.mint(&setup2.payer, &500_0000000i128);
+    setup2.client.settle_repayment(&setup2.payer, &500_0000000i128);
+    setup2.env.ledger().set_timestamp(repayment_deadline + 10);
+    setup2.client.declare_default(&setup2.investor1);
+
+    // Secondary recovery tranche arrives (100 USDC)
+    setup2.token_admin.mint(&setup2.payer, &100_0000000i128);
+    setup2.client.settle_repayment(&setup2.payer, &100_0000000i128);
+
+    // Permissionless secondary recovery disbursal: executed without investor1 authorization
+    let bal1_before = setup2.token_client.balance(&setup2.investor1);
+    let sec_payout = setup2.client.claim_secondary_recovery(&setup2.investor1, &Some(10));
+    assert_eq!(sec_payout, 60_0000000i128); // 60% of 100 USDC = 60 USDC
+    assert_eq!(setup2.token_client.balance(&setup2.investor1), bal1_before + 60_0000000i128);
+
+    // Replay idempotency: immediate replay when no new tranches exist safely returns Ok(0)
+    // with strictly zero duplicate payouts!
+    let replay_payout = setup2.client.claim_secondary_recovery(&setup2.investor1, &Some(10));
+    assert_eq!(replay_payout, 0);
+    assert_eq!(setup2.token_client.balance(&setup2.investor1), bal1_before + 60_0000000i128);
 }

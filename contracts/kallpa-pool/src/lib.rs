@@ -113,7 +113,7 @@ impl KallpaPoolContract {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(Error::AlreadyInitialized);
         }
-        if target_amount <= 0 || target_amount > MAX_MONETARY_CAP || repayment_target < target_amount || repayment_target > MAX_MONETARY_CAP || min_contribution <= 0 || min_contribution > target_amount {
+        if target_amount <= 0 || target_amount > MAX_MONETARY_CAP || repayment_target < target_amount || repayment_target > MAX_MONETARY_CAP || min_contribution < MIN_RECOVERY_TRANCHE || min_contribution > target_amount {
             return Err(Error::InvalidAmount);
         }
         let now = env.ledger().timestamp();

@@ -1,0 +1,9 @@
+{
+  "name": "@kallpa/keeper",
+  "version": "0.1.0",
+  "description": "Autonomous Keeper Service Daemon for Kallpa Protocol Micro-Claims and Auto-Restoration",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.0.0"
+  }
+}
