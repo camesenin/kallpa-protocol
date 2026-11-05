@@ -1199,19 +1199,69 @@ fn test_min_contribution_enforcement_and_dust_clamping_rejection() {
     let res_low = setup.client.try_contribute(&setup.investor1, &5_0000000i128);
     assert_eq!(res_low, Err(Ok(Error::InvalidAmount)));
 
-    // 2. Investor 1 contributes 995 USDC (leaving only 5 USDC remaining capacity)
-    let c1 = 995_0000000i128;
+    // 2. Investor 1 attempts to contribute 995 USDC.
+    // Target is 1,000 USDC. A contribution of 995 USDC would leave remaining_after = 5 USDC,
+    // which is strictly below min_contribution (10 USDC).
+    // The pool viability guard rejects this with InvalidAmount to prevent creating an unfillable stranded residual!
+    let res_leaving_dust = setup.client.try_contribute(&setup.investor1, &995_0000000i128);
+    assert_eq!(res_leaving_dust, Err(Ok(Error::InvalidAmount)));
+
+    // 3. Investor 1 contributes 980 USDC (leaving 20 USDC >= min_contribution 10 USDC).
+    // This is valid as remaining_after (20 USDC) >= min_contribution (10 USDC).
+    let c1 = 980_0000000i128;
     assert_eq!(setup.client.contribute(&setup.investor1, &c1), c1);
 
-    // 3. Investor 2 attempts to contribute 20 USDC.
-    // Clamping to remaining capacity would yield 5 USDC (< min_contribution of 10 USDC).
-    // The contract strictly rejects this with InvalidAmount to prevent micro-dust stranded entries!
-    let res_clamped_dust = setup.client.try_contribute(&setup.investor2, &20_0000000i128);
-    assert_eq!(res_clamped_dust, Err(Ok(Error::InvalidAmount)));
+    // 4. Investor 2 attempts to contribute 15 USDC (leaving 5 USDC < min_contribution).
+    // Again, rejected by the pool viability guard.
+    let res_partial_dust = setup.client.try_contribute(&setup.investor2, &15_0000000i128);
+    assert_eq!(res_partial_dust, Err(Ok(Error::InvalidAmount)));
 
-    // 4. Investor 3 attempts to contribute 5 USDC. Directly rejected as well.
+    // 5. Direct dust contribution of 5 USDC is strictly rejected while pool is Open.
     let investor3 = Address::generate(&setup.env);
     setup.token_admin.mint(&investor3, &100_000_0000000);
     let res_direct_dust = setup.client.try_contribute(&investor3, &5_0000000i128);
     assert_eq!(res_direct_dust, Err(Ok(Error::InvalidAmount)));
+
+    // 6. Investor 2 contributes 20 USDC (or any amount >= 20 USDC that completely fills the pool: remaining_after == 0).
+    // This successfully fills and completes the pool!
+    let c2 = 25_0000000i128; // will be clamped to 20 USDC, leaving remaining_after = 0
+    assert_eq!(setup.client.contribute(&setup.investor2, &c2), 20_0000000i128);
+}
+
+#[test]
+fn test_permissionless_disbursal_and_third_party_claim() {
+    let setup = setup_test();
+    let target = 1_000_0000000i128; // 1,000 USDC
+    let min_contribution = 10_0000000i128; // 10 USDC minimum
+    let repayment_target = 1_100_0000000i128; // 1,100 USDC (10% yield)
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Investor 1 deposits 500 USDC, Investor 2 deposits 500 USDC (reaches target)
+    setup.client.contribute(&setup.investor1, &500_0000000i128);
+    setup.client.contribute(&setup.investor2, &500_0000000i128);
+
+    // Payer settles repayment
+    setup.token_admin.mint(&setup.payer, &repayment_target);
+    setup.client.settle_repayment(&setup.payer, &repayment_target);
+
+    // Disbursal is completely permissionless: investor1 does not need to sign!
+    // A keeper or third-party can trigger claim_return for investor1 directly.
+    let balance_before = setup.token_client.balance(&setup.investor1);
+    let payout = setup.client.claim_return(&setup.investor1);
+    assert_eq!(payout, 550_0000000i128);
+    let balance_after = setup.token_client.balance(&setup.investor1);
+    assert_eq!(balance_after - balance_before, 550_0000000i128);
 }

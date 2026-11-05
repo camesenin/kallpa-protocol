@@ -199,6 +199,14 @@ impl KallpaPoolContract {
             return Err(Error::InvalidAmount);
         }
 
+        // Guarantee pool completion viability: A contribution must either fill the pool completely (remaining_after == 0)
+        // or leave at least min_contribution available for subsequent depositors (remaining_after >= min_contribution).
+        // This strictly prevents creating an unfillable stranded residual capacity in Open state!
+        let remaining_after = remaining.checked_sub(actual_contribution).ok_or(Error::MathOverflow)?;
+        if remaining_after > 0 && remaining_after < config.min_contribution {
+            return Err(Error::InvalidAmount);
+        }
+
         // Pull funds from contributor to pool contract
         let token_client = token::Client::new(&env, &config.asset);
         token_client.transfer(&investor, &env.current_contract_address(), &actual_contribution);
@@ -433,7 +441,9 @@ impl KallpaPoolContract {
     /// Payout_i = floor(CumAfter_i * Repaid / Target) - floor(CumPrior_i * Repaid / Target)
     /// Guarantees that sum(Payout_i) == TotalRepaid with zero residual dust.
     pub fn claim_return(env: Env, investor: Address) -> Result<i128, Error> {
-        investor.require_auth();
+        // Permissionless disbursal: anyone (investor, keeper, or relayer) can invoke claim_return.
+        // Funds are strictly transferred to investor, eliminating the requirement for investor auth
+        // and resolving micro-claim abandoned fund issues when fees exceed claim value.
 
         let config: PoolConfig = env
             .storage()
@@ -525,7 +535,8 @@ impl KallpaPoolContract {
 
     /// Refund contribution strictly when pool deadline expired without reaching target.
     pub fn refund(env: Env, investor: Address) -> Result<i128, Error> {
-        investor.require_auth();
+        // Permissionless refund disbursal: anyone can trigger refund on behalf of investor.
+        // Funds are strictly transferred to investor, preventing stranded funds.
 
         let config: PoolConfig = env
             .storage()
@@ -596,7 +607,7 @@ impl KallpaPoolContract {
         investor: Address,
         max_tranches: Option<u32>,
     ) -> Result<i128, Error> {
-        investor.require_auth();
+        // Permissionless secondary recovery disbursal: anyone can trigger distribution to investor.
 
         let config: PoolConfig = env
             .storage()
