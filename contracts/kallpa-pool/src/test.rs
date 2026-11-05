@@ -1093,11 +1093,17 @@ fn test_secondary_tranche_chunking_and_bounded_materialization_at_monetary_cap()
 
 #[test]
 fn test_flush_secondary_buffer_slices_at_max_monetary_cap_preventing_overflow() {
-    // Verifies hostile Council finding:
-    // When PendingSecondaryBuffer contains an amount exceeding MAX_MONETARY_CAP (e.g. 2 * 10^19 stroops),
-    // flush_secondary_buffer MUST NOT create a single massive tranche of 2 * 10^19!
-    // It must slice into tranches <= MAX_MONETARY_CAP (10^19).
-    // Claims by a participant with cum_after = total_collected = 10^19 MUST NOT panic with MathOverflow!
+    // Exactly implements the hostile Council specification:
+    // 1. With cum_after = total_collected = 10^19 (MAX_MONETARY_CAP), introduce 12 * 10^19 into pool.
+    // 2. Reconcile materializes exactly 10 tranches of 10^19 (bounded by MAX_TRANCHES_PER_TX = 10).
+    // 3. Exactly 2 * 10^19 remains in PendingSecondaryBuffer!
+    // 4. Advance time past FLUSH_COOLDOWN_SECONDS (24h) and invoke flush_secondary_buffer!
+    // 5. flush_secondary_buffer materializes exactly 2 tranches of 10^19 each (NOT a single 2 * 10^19 tranche!).
+    // 6. Contributor claims all 12 tranches:
+    //    Each tranche is 10^19. cum_after = 10^19.
+    //    Product: cum_after * S_k = 10^19 * 10^19 = 10^38 < i128::MAX (approx 1.7 * 10^38).
+    //    Evaluates with ZERO MathOverflow! Total claimed = 12 * 10^19.
+    // 7. Subsequent flush returns 0 (buffer empty), pool balance concludes at 0!
     let setup = setup_test();
     let cap = 10_000_000_000_000_000_000i128; // 10^19 stroops
     let target = cap;
@@ -1118,34 +1124,52 @@ fn test_flush_secondary_buffer_slices_at_max_monetary_cap_preventing_overflow() 
         &min_contribution,
     );
 
-    // Contributor 1 deposits 10^19 (100% of capacity, maximum possible cum_after!)
+    // Contributor 1 deposits 10^19 (100% capacity, maximum cum_after = 10^19)
     setup.token_admin.mint(&setup.investor1, &cap);
     setup.client.contribute(&setup.investor1, &cap);
 
-    // Payer repays target of 10^19 -> Settled
+    // Repay target of 10^19 -> Settled
     setup.token_admin.mint(&setup.payer, &cap);
     setup.client.settle_repayment(&setup.payer, &cap);
 
-    // Contributor claims primary return of 10^19
+    // Claim primary return of 10^19
     assert_eq!(setup.client.claim_return(&setup.investor1), cap);
 
-    // Now simulate an inflow of 2 * 10^19 entering PendingSecondaryBuffer via direct push
-    let massive_surplus = 2 * cap; // 2 * 10^19
-    setup.token_admin.mint(&setup.tw_escrow, &massive_surplus);
-    setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &massive_surplus);
+    // Step 1: Push 12 * 10^19 directly to KallpaPool address
+    let massive_inflow = 12 * cap; // 12 * 10^19 stroops
+    setup.token_admin.mint(&setup.tw_escrow, &massive_inflow);
+    setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &massive_inflow);
 
-    // Advance past repayment deadline and reconcile
+    // Advance past repayment deadline so reconcile opens
     setup.env.ledger().set_timestamp(repayment_deadline + 10);
-    let rec = setup.client.reconcile_incoming_balance(&setup.investor1);
-    assert_eq!(rec, massive_surplus);
 
-    // Tranches materialized by record_secondary_tranche:
-    // Because MAX_TRANCHES_PER_TX = 10 and amount = 2 * 10^19, it slices into exactly 2 tranches of 10^19!
-    // Contributor claims secondary recovery:
-    // Each tranche is 10^19. cum_after is 10^19.
-    // Product: cum_after * S_k = 10^19 * 10^19 = 10^38 < i128::MAX (approx 1.7 * 10^38).
-    // MUST NOT overflow!
+    // Step 2: Reconcile incoming balance.
+    // Bounded by MAX_TRANCHES_PER_TX = 10, it materializes exactly 10 tranches of 10^19!
+    let rec = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(rec, massive_inflow);
+
+    // Step 3: Advance past FLUSH_COOLDOWN_SECONDS (86,400s) to call flush_secondary_buffer
+    setup.env.ledger().set_timestamp(repayment_deadline + 10 + 86400 + 1);
+
+    // Step 4: ACTUALLY INVOKE flush_secondary_buffer on the 2 * 10^19 remaining in buffer!
+    // Under the fixed implementation, flush slices this into 2 discrete tranches of 10^19 each!
+    let flushed = setup.client.flush_secondary_buffer(&setup.investor1);
+    assert_eq!(flushed, 2 * cap); // Exactly 2 * 10^19 flushed!
+
+    // Step 5: Contributor claims all 12 secondary tranches
+    // Batch limit is 50, so all 12 are claimed in one call.
+    // Under the broken code, Tranche #11 would have had amount = 2 * 10^19, causing:
+    // cum_after * S_11 = 10^19 * (2 * 10^19) = 2 * 10^38 > i128::MAX -> MathOverflow PANIC!
+    // Under the fixed code, all tranches are <= 10^19, so product <= 10^38 < i128::MAX.
     let claimed_sec = setup.client.claim_secondary_recovery(&setup.investor1, &None);
-    assert_eq!(claimed_sec, massive_surplus);
+    assert_eq!(claimed_sec, massive_inflow);
+
+    // Step 6: Subsequent flush on empty buffer returns 0
+    // (Must wait cooldown or test cooldown rejection)
+    setup.env.ledger().set_timestamp(repayment_deadline + 10 + 2 * 86400 + 2);
+    let flushed_empty = setup.client.flush_secondary_buffer(&setup.investor1);
+    assert_eq!(flushed_empty, 0i128);
+
+    // Step 7: Contract token balance strictly 0 (absolute conservation)
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
