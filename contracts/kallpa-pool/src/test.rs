@@ -422,7 +422,7 @@ fn test_admin_declare_settled_on_partial_repayment() {
 }
 
 #[test]
-fn test_late_repayment_rejected_after_settled() {
+fn test_late_repayment_routed_to_secondary_recovery_after_settled() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
     let min_contribution = 100_0000000i128;
@@ -457,15 +457,27 @@ fn test_late_repayment_rejected_after_settled() {
     let p1 = setup.client.claim_return(&setup.investor1);
     assert_eq!(p1, 6_600_0000000i128);
 
-    // Payer attempts a late repayment of 1,000 USDC after pool is Settled
-    // INVARIANT: Late repayment MUST be strictly rejected with PoolAlreadySettled to prevent R alteration mid-distribution
-    let res = setup.client.try_settle_repayment(&setup.payer, &1_000_0000000i128);
-    assert_eq!(res, Err(Ok(Error::PoolAlreadySettled)));
+    // Payer sends late repayment / surplus recovery of 1,000 USDC after pool is Settled
+    // INVARIANT: Late recovery does NOT alter primary R (which remains 11,000 USDC)
+    // Instead, it routes to SecondaryRecovery, and can be claimed pro-rata via claim_secondary_recovery
+    setup.client.settle_repayment(&setup.payer, &1_000_0000000i128);
 
-    // Investor 2 claims return unaffected
+    let (_, state_after, _, repaid_after) = setup.client.get_pool_info();
+    assert_eq!(state_after, PoolState::Settled);
+    assert_eq!(repaid_after, 11_000_0000000i128); // Primary R is strictly frozen!
+
+    // Investor 2 claims primary return unaffected (40% of 11,000)
     let p2 = setup.client.claim_return(&setup.investor2);
     assert_eq!(p2, 4_400_0000000i128);
     assert_eq!(p1 + p2, 11_000_0000000i128);
+
+    // Investors now claim their secondary recovery pro-rata (60% and 40% of 1,000 USDC)
+    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1);
+    assert_eq!(sec1, 600_0000000i128);
+
+    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2);
+    assert_eq!(sec2, 400_0000000i128);
+    assert_eq!(sec1 + sec2, 1_000_0000000i128);
 }
 
 #[test]
@@ -523,4 +535,80 @@ fn test_multi_tranche_repayment_reaches_repayment_target_with_yield() {
     assert_eq!(p2, 4_400_0000000i128); // 40% of 11,000
 
     assert_eq!(p1 + p2, repayment_target);
+}
+
+#[test]
+fn test_post_default_secondary_recovery_flow() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128; // 10,000 USDC
+    let repayment_target = 11_000_0000000i128; // 11,000 USDC
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Investors fund target: inv1 = 60%, inv2 = 40%
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    // Borrower only repays 5,000 USDC before repayment_deadline
+    setup.client.settle_repayment(&setup.payer, &5_000_0000000i128);
+
+    // Repayment deadline passes, borrower defaults
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
+
+    // Permissionless declare_default transitions to Settled and freezes primary R at 5,000 USDC
+    setup.client.declare_default(&setup.investor1);
+    let (_, state, _, primary_repaid) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Settled);
+    assert_eq!(primary_repaid, 5_000_0000000i128);
+
+    // Investors claim primary recovery (60% of 5,000 = 3,000; 40% of 5,000 = 2,000)
+    let p1 = setup.client.claim_return(&setup.investor1);
+    assert_eq!(p1, 3_000_0000000i128);
+    let p2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(p2, 2_000_0000000i128);
+    assert_eq!(p1 + p2, 5_000_0000000i128);
+
+    // Weeks later, debt collection / restructuring recovers an additional 3,000 USDC
+    // Settle_repayment routes this late recovery into SecondaryRecovery without failing
+    setup.client.settle_repayment(&setup.payer, &3_000_0000000i128);
+
+    // Primary R remains strictly 5,000 USDC
+    let (_, _, _, primary_after) = setup.client.get_pool_info();
+    assert_eq!(primary_after, 5_000_0000000i128);
+
+    // Investors claim their pro-rata of secondary recovery (60% of 3,000 = 1,800; 40% of 3,000 = 1,200)
+    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1);
+    assert_eq!(sec1, 1_800_0000000i128);
+    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2);
+    assert_eq!(sec2, 1_200_0000000i128);
+    assert_eq!(sec1 + sec2, 3_000_0000000i128);
+
+    // An additional third tranche of 2,000 USDC arrives later
+    setup.client.settle_repayment(&setup.payer, &2_000_0000000i128);
+
+    // Subsequent claims pull the incremental entitlement (60% of 2,000 = 1,200; 40% of 2,000 = 800)
+    let sec1_t2 = setup.client.claim_secondary_recovery(&setup.investor1);
+    assert_eq!(sec1_t2, 1_200_0000000i128);
+    let sec2_t2 = setup.client.claim_secondary_recovery(&setup.investor2);
+    assert_eq!(sec2_t2, 800_0000000i128);
+    assert_eq!(sec1_t2 + sec2_t2, 2_000_0000000i128);
+
+    // Total recovered across all tranches: 5,000 + 3,000 + 2,000 = 10,000 USDC
+    // Total received by Inv1: 3,000 + 1,800 + 1,200 = 6,000 USDC (exact 60%)
+    // Total received by Inv2: 2,000 + 1,200 + 800 = 4,000 USDC (exact 40%)
+    assert_eq!(p1 + sec1 + sec1_t2, 6_000_0000000i128);
+    assert_eq!(p2 + sec2 + sec2_t2, 4_000_0000000i128);
 }

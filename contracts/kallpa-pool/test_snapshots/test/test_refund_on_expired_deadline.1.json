@@ -430,6 +430,14 @@
                     "val": {
                       "i128": "0"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "secondary_claimed"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
                   }
                 ]
               }

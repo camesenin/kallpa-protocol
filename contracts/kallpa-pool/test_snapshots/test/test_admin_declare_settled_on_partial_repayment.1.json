@@ -635,6 +635,14 @@
                     "val": {
                       "i128": "0"
                     }
+                  },
+                  {
+                    "key": {
+                      "symbol": "secondary_claimed"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
                   }
                 ]
               }
@@ -699,6 +707,14 @@
                   {
                     "key": {
                       "symbol": "principal"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "secondary_claimed"
                     },
                     "val": {
                       "i128": "0"

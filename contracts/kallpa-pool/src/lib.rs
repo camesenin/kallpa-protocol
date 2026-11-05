@@ -142,6 +142,7 @@ impl KallpaPoolContract {
             cum_prior,
             cum_after: new_total,
             claimed: false,
+            secondary_claimed: 0,
         };
 
         env.storage().persistent().set(&position_key, &position);
@@ -187,21 +188,34 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        // Repayments are strictly allowed only in Funded state before the pool is frozen into Settled.
-        // Once Settled or Disputed, R becomes strictly immutable to protect pro-rata distribution integrity.
-        if state == PoolState::Settled {
-            return Err(Error::PoolAlreadySettled);
-        }
-        if state != PoolState::Funded {
-            return Err(Error::PoolNotFunded);
-        }
-
         if amount <= 0 || amount > MAX_MONETARY_CAP {
             return Err(Error::InvalidAmount);
         }
 
         let token_client = token::Client::new(&env, &config.asset);
-        token_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+        // If pool is already Settled or Disputed, any post-settlement repayment or late recovery
+        // accumulates safely into SecondaryRecovery without altering frozen primary R.
+        if state == PoolState::Settled || state == PoolState::Disputed {
+            token_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+            let sec_rec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryRecovery)
+                .unwrap_or(0);
+            let new_sec = sec_rec.checked_add(amount).ok_or(Error::MathOverflow)?;
+            if new_sec > MAX_MONETARY_CAP {
+                return Err(Error::CapacityExceeded);
+            }
+            env.storage().instance().set(&DataKey::SecondaryRecovery, &new_sec);
+            env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            return Ok(());
+        }
+
+        if state != PoolState::Funded {
+            return Err(Error::PoolNotFunded);
+        }
 
         let total_repaid: i128 = env
             .storage()
@@ -209,8 +223,39 @@ impl KallpaPoolContract {
             .get(&DataKey::TotalRepaid)
             .unwrap_or(0);
 
-        let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
+        let remaining_obligation = config
+            .repayment_target
+            .checked_sub(total_repaid)
+            .ok_or(Error::MathOverflow)?;
+
+        if remaining_obligation <= 0 {
+            return Err(Error::CapacityExceeded);
+        }
+
+        // Cap primary allocation at repayment_target; any surplus automatically buffers into SecondaryRecovery
+        let (primary_part, secondary_part) = if amount > remaining_obligation {
+            (remaining_obligation, amount.checked_sub(remaining_obligation).ok_or(Error::MathOverflow)?)
+        } else {
+            (amount, 0i128)
+        };
+
+        token_client.transfer(&payer, &env.current_contract_address(), &amount);
+
+        let new_repaid = total_repaid.checked_add(primary_part).ok_or(Error::MathOverflow)?;
         env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
+
+        if secondary_part > 0 {
+            let sec_rec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryRecovery)
+                .unwrap_or(0);
+            let new_sec = sec_rec.checked_add(secondary_part).ok_or(Error::MathOverflow)?;
+            if new_sec > MAX_MONETARY_CAP {
+                return Err(Error::CapacityExceeded);
+            }
+            env.storage().instance().set(&DataKey::SecondaryRecovery, &new_sec);
+        }
 
         // Once the full agreed obligation (principal + yield) is reached, pool moves to Settled
         if new_repaid >= config.repayment_target {
@@ -277,7 +322,8 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        if state != PoolState::Funded {
+        // Allow dispute refund from Funded (primary transition to Disputed), or from Settled/Disputed (accumulating into SecondaryRecovery)
+        if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
             return Err(Error::PoolNotFunded);
         }
 
@@ -290,17 +336,30 @@ impl KallpaPoolContract {
             token_client.transfer(&caller, &env.current_contract_address(), &amount);
         }
 
-        let total_repaid: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalRepaid)
-            .unwrap_or(0);
+        if state == PoolState::Funded {
+            let total_repaid: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalRepaid)
+                .unwrap_or(0);
 
-        let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
+            let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
+            env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
+        } else {
+            // Already Settled or Disputed: late dispute refund accumulates safely into SecondaryRecovery
+            let sec_rec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryRecovery)
+                .unwrap_or(0);
+            let new_sec = sec_rec.checked_add(amount).ok_or(Error::MathOverflow)?;
+            if new_sec > MAX_MONETARY_CAP {
+                return Err(Error::CapacityExceeded);
+            }
+            env.storage().instance().set(&DataKey::SecondaryRecovery, &new_sec);
+        }
 
-        // Store accumulated refunded dispute balance into TotalRepaid for exact telescoping claims
-        env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
-        env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }
@@ -449,6 +508,91 @@ impl KallpaPoolContract {
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(refund_amount)
+    }
+
+
+    /// Participant claims their exact pro-rata entitlement of late/secondary recoveries
+    /// arriving after the pool has entered Settled or Disputed state.
+    /// Can be called multiple times as new recovery tranches arrive.
+    pub fn claim_secondary_recovery(env: Env, investor: Address) -> Result<i128, Error> {
+        investor.require_auth();
+
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state != PoolState::Settled && state != PoolState::Disputed {
+            return Err(Error::PoolNotSettled);
+        }
+
+        let position_key = DataKey::Position(investor.clone());
+        let mut position: Position = env
+            .storage()
+            .persistent()
+            .get(&position_key)
+            .ok_or(Error::NoPosition)?;
+
+        let total_collected: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCollected)
+            .unwrap_or(0);
+
+        let secondary_total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecondaryRecovery)
+            .unwrap_or(0);
+
+        if total_collected <= 0 || secondary_total <= 0 {
+            return Ok(0);
+        }
+
+        // Telescoping cumulative formula over secondary recovery buffer
+        let upper = position
+            .cum_after
+            .checked_mul(secondary_total)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(total_collected)
+            .ok_or(Error::MathOverflow)?;
+
+        let lower = position
+            .cum_prior
+            .checked_mul(secondary_total)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(total_collected)
+            .ok_or(Error::MathOverflow)?;
+
+        let cumulative_entitlement = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
+        let claimable = cumulative_entitlement
+            .checked_sub(position.secondary_claimed)
+            .ok_or(Error::MathOverflow)?;
+
+        if claimable <= 0 {
+            return Ok(0);
+        }
+
+        position.secondary_claimed = cumulative_entitlement;
+        env.storage().persistent().set(&position_key, &position);
+        env.storage().persistent().extend_ttl(
+            &position_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let token_client = token::Client::new(&env, &config.asset);
+        token_client.transfer(&env.current_contract_address(), &investor, &claimable);
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(claimable)
     }
 
     /// Read current pool configuration and status.

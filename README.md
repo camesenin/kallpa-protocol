@@ -126,7 +126,7 @@ SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2=1 cargo build --target wasm32v
 ```bash
 cargo test --workspace
 ```
-*Current test suite: 9 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, strict late repayment rejection after Settled, and multi-tranche repayment reaching repayment_target with yield).*
+*Current test suite: 10 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, and post-default secondary recovery flow with multiple recovery tranches).*
 
 ### 3. Run TypeScript SDK Tests
 ```bash
