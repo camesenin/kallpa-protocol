@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | **Stellar Testnet** | CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX | [Stellar.Expert](https://stellar.expert/explorer/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) · [Stellar Lab](https://lab.stellar.org/r/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) |
 | **Deployer** | GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E | [Stellar.Expert](https://stellar.expert/explorer/testnet/account/GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E) |
-| **WASM Hash** | 5c7096f3739ca0b8532f3aca2a44c6cbda293162134adb8a434eec943bbdea68 (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 28 / Soroban v28 |
+| **WASM Hash** | bd21e69c9be42681e5da31f6de3f95056122e921ead9740f108c80c9a1ae7076 (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 28 / Soroban v28 |
 
 ---
 
@@ -126,7 +126,7 @@ SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2=1 cargo build --target wasm32v
 ```bash
 cargo test --workspace
 ```
-*Current test suite: 15 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, and post-default secondary recovery flow with multiple recovery tranches).*
+*Current test suite: 16 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, and post-default secondary recovery flow with multiple recovery tranches).*
 
 ### 3. Run TypeScript SDK Tests
 ```bash

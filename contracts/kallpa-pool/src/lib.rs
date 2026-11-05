@@ -738,6 +738,15 @@ impl KallpaPoolContract {
         let tranche_key = DataKey::SecondaryTranche(new_count);
         env.storage().persistent().set(&tranche_key, &pending);
         env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let total_sec: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSecondaryAllocated)
+            .unwrap_or(0);
+        let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
+        env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         Ok(pending)
@@ -768,8 +777,9 @@ impl KallpaPoolContract {
         }
 
         let now = env.ledger().timestamp();
-        // Disputed transitions can ONLY be triggered after funding_deadline, or caller must be tw_escrow or admin
-        if state == PoolState::Funded && caller != config.tw_escrow && caller != config.admin && now <= config.funding_deadline {
+        // In Funded state, external reconcile can ONLY be triggered by authenticated tw_escrow/admin,
+        // or permissionlessly strictly AFTER repayment_deadline has elapsed (default/dispute window)
+        if state == PoolState::Funded && caller != config.tw_escrow && caller != config.admin && now <= config.repayment_deadline {
             return Err(Error::Unauthorized);
         }
 

@@ -905,8 +905,13 @@ fn test_autonomous_balance_reconciliation_on_direct_tw_refund() {
     setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &7_500_0000000i128);
     assert_eq!(setup.token_client.balance(&setup.contract_id), 7_500_0000000i128);
 
-    // Advance past funding deadline so any participant can permissionlessly reconcile
+    // In Funded state before repayment deadline: third-party/contributor cannot force premature Disputed transition
     setup.env.ledger().set_timestamp(funding_deadline + 10);
+    let premature_res = setup.client.try_reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(premature_res, Err(Ok(Error::Unauthorized)));
+
+    // Advance past repayment_deadline: loan defaulted/disputed window opens permissionlessly
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
 
     let surplus = setup.client.reconcile_incoming_balance(&setup.investor1);
     assert_eq!(surplus, 7_500_0000000i128);
@@ -938,5 +943,85 @@ fn test_autonomous_balance_reconciliation_on_direct_tw_refund() {
     assert_eq!(sec1, 600_0000000i128); // 60% of 1,000
     assert_eq!(sec2, 400_0000000i128); // 40% of 1,000
     assert_eq!(sec1 + sec2, 1_000_0000000i128);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+}
+
+
+#[test]
+fn test_flush_and_reconcile_preserves_solvency_and_prevents_phantom_surplus() {
+    // Tests the hostile Council finding:
+    // When flush_secondary_buffer creates a tranche from PendingSecondaryBuffer,
+    // TotalSecondaryAllocated is incremented.
+    // Subsequent calls to reconcile_incoming_balance (both before and after claims)
+    // MUST strictly recognize 0 unallocated surplus!
+    // No phantom tranches or over-claims are possible.
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128); // 60%
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128); // 40%
+
+    // Repay 10,000.5 USDC -> settles pool, puts 0.5 USDC (5_000_000 stroops) into PendingSecondaryBuffer
+    setup.client.settle_repayment(&setup.payer, &10_000_5000000i128);
+
+    // Primary claims
+    assert_eq!(setup.client.claim_return(&setup.investor1), 6_000_0000000i128);
+    assert_eq!(setup.client.claim_return(&setup.investor2), 4_000_0000000i128);
+
+    // Flush the buffer to create Tranche #1 (0.5 USDC)
+    let flushed = setup.client.flush_secondary_buffer(&setup.investor2);
+    assert_eq!(flushed, 5_000_000i128);
+
+    // ADVERSARIAL CHECK 1: Immediately call reconcile_incoming_balance.
+    // MUST return 0 because the 0.5 USDC is already allocated to Tranche #1!
+    let recon_before_claim = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(recon_before_claim, 0i128);
+
+    // Investor 1 claims secondary share (60% of 0.5 USDC = 3_000_000 stroops)
+    let s1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    assert_eq!(s1, 3_000_000i128);
+
+    // ADVERSARIAL CHECK 2: Reconcile between claims.
+    // Still MUST return 0!
+    let recon_mid_claim = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(recon_mid_claim, 0i128);
+
+    // Investor 2 claims secondary share (40% of 0.5 USDC = 2_000_000 stroops)
+    let s2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(s2, 2_000_000i128);
+
+    // ADVERSARIAL CHECK 3: Reconcile after all claims when contract balance is 0.
+    // MUST return 0! (Previous bug calculated 0 - (-0.5) = +0.5 phantom surplus).
+    let recon_after_all = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(recon_after_all, 0i128);
+
+    // Now a legitimate recovery of 1.0 USDC arrives
+    setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &10_000_000i128);
+    let legitimate_surplus = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(legitimate_surplus, 10_000_000i128); // exactly 1.0 USDC, NOT 1.5!
+
+    // Both claim exact shares: 6_000_000 and 4_000_000
+    let s1_t2 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    let s2_t2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(s1_t2, 6_000_000i128);
+    assert_eq!(s2_t2, 4_000_000i128);
+
+    // Absolute zero residual dust in contract
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
