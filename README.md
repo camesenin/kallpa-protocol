@@ -113,16 +113,22 @@ kallpa-protocol/
 ## 🚀 Getting Started
 
 ### Prerequisites
-- **Rust Toolchain:** `rustc 1.80+` with target `wasm32-unknown-unknown`
-- **Bun:** `v1.1+` (recommended for SDK and tests) or **Node.js:** `v20+`
+- **Rust Toolchain:** `rustc 1.99.1+` with target `wasm32v1-none` (Soroban Protocol 22/23 standard)
+- **Bun:** `v1.4+` (recommended for SDK and tests) or **Node.js:** `v20+`
 
-### 1. Run Smart Contract Tests
+### 1. Build Smart Contract WASM
+```bash
+# Build for wasm32v1-none (Protocol 22/23 target with spec-shaking v2 enabled):
+SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2=1 cargo build --target wasm32v1-none --release
+```
+
+### 2. Run Smart Contract Tests
 ```bash
 cargo test --workspace
 ```
 *Current test suite: 9 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, strict late repayment rejection after Settled, and multi-tranche repayment reaching repayment_target with yield).*
 
-### 2. Run TypeScript SDK Tests
+### 3. Run TypeScript SDK Tests
 ```bash
 cd packages/sdk
 bun test
