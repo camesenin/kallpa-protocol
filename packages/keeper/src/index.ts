@@ -3,7 +3,8 @@
  *
  * Implements full coverage of claim_return, refund, and claim_secondary_recovery,
  * real position processing, per-transaction sponsor balance preservation based on
- * final assembled envelope fees, Protocol 23 restoration fallback, and robust confirmation.
+ * final assembled envelope fees, Protocol 23 restoration fallback, simulation zero-payout
+ * short-circuiting to prevent gas wastage, and robust confirmation.
  */
 
 import {
@@ -100,13 +101,15 @@ export class KallpaKeeperDaemon {
 
   /**
    * Monitor registered pools and disburse pending claims permissionlessly
-   * across all three protocol claiming routes with continuous per-transaction budget protection.
+   * across all three protocol claiming routes with continuous per-transaction budget protection
+   * and short-circuiting of zero-payout claims to prevent wasting sponsor funds.
    */
   async runSweepCycle(
     targetsByPool: Map<string, InvestorClaimTarget[]>
-  ): Promise<{ processed: number; errors: number; skippedForLowFunds: boolean }> {
+  ): Promise<{ processed: number; errors: number; skippedForLowFunds: boolean; skippedZeroPayout: number }> {
     let processed = 0;
     let errors = 0;
+    let skippedZeroPayout = 0;
 
     for (const poolId of this.config.poolContractIds) {
       const targets = targetsByPool.get(poolId) || [];
@@ -116,23 +119,29 @@ export class KallpaKeeperDaemon {
         const solvency = await this.checkSponsorSolvency();
         if (!solvency.solvent) {
           console.warn(`Sponsor reserve low (${solvency.availableStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
-          return { processed, errors, skippedForLowFunds: true };
+          return { processed, errors, skippedForLowFunds: true, skippedZeroPayout };
         }
 
         try {
+          let txHash: string | null = null;
           if (target.action === "claim_return") {
-            await this.disburseClaimReturn(poolContract, target.investor);
+            txHash = await this.disburseClaimReturn(poolContract, target.investor);
           } else if (target.action === "refund") {
-            await this.disburseRefund(poolContract, target.investor);
+            txHash = await this.disburseRefund(poolContract, target.investor);
           } else if (target.action === "claim_secondary") {
             const tranches = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
-            await this.disburseSecondaryRecovery(
+            txHash = await this.disburseSecondaryRecovery(
               poolContract,
               target.investor,
               tranches
             );
           }
-          processed++;
+
+          if (txHash === null) {
+            skippedZeroPayout++;
+          } else {
+            processed++;
+          }
         } catch (err) {
           console.error(`Failed disbursing ${target.action} for ${target.investor}:`, err);
           errors++;
@@ -140,13 +149,13 @@ export class KallpaKeeperDaemon {
       }
     }
 
-    return { processed, errors, skippedForLowFunds: false };
+    return { processed, errors, skippedForLowFunds: false, skippedZeroPayout };
   }
 
   /**
    * Route 1: Disburse primary claim_return
    */
-  async disburseClaimReturn(poolContract: Contract, investor: string): Promise<string> {
+  async disburseClaimReturn(poolContract: Contract, investor: string): Promise<string | null> {
     return this.executePermissionlessCall(poolContract, "claim_return", [
       new Address(investor).toScVal(),
     ]);
@@ -155,7 +164,7 @@ export class KallpaKeeperDaemon {
   /**
    * Route 2: Disburse refund on expired pool
    */
-  async disburseRefund(poolContract: Contract, investor: string): Promise<string> {
+  async disburseRefund(poolContract: Contract, investor: string): Promise<string | null> {
     return this.executePermissionlessCall(poolContract, "refund", [
       new Address(investor).toScVal(),
     ]);
@@ -169,7 +178,7 @@ export class KallpaKeeperDaemon {
     poolContract: Contract,
     investor: string,
     maxTranches: number
-  ): Promise<string> {
+  ): Promise<string | null> {
     if (typeof maxTranches !== "number" || !Number.isInteger(maxTranches) || maxTranches < 1 || maxTranches > 50) {
       throw new Error(`Invalid maxTranches: ${maxTranches}. Must be an integer between 1 and 50.`);
     }
@@ -183,14 +192,15 @@ export class KallpaKeeperDaemon {
 
   /**
    * Universal execution pipeline with Protocol 23 state restoration and strict confirmation.
-   * Strictly verifies that available balance covers final assembled transaction envelope fee
-   * (including Soroban resource fee) while preserving the configured sponsor cushion.
+   * Strictly checks simulated return value: if simulation returns Ok(0) (e.g. repeated secondary claim
+   * with zero new recovery to distribute), the function short-circuits and returns null without submitting,
+   * completely preventing gas/sponsor exhaustion on exhausted claims.
    */
   private async executePermissionlessCall(
     poolContract: Contract,
     method: string,
     args: xdr.ScVal[]
-  ): Promise<string> {
+  ): Promise<string | null> {
     const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
     const baseInclusionFee = 100000n; // 0.01 XLM base inclusion fee
 
@@ -208,14 +218,30 @@ export class KallpaKeeperDaemon {
       throw new Error(`Simulation failed: ${simRes.error}`);
     }
 
+    // Inspect simulation result: if payout is 0, do NOT waste sponsor gas!
+    if (simRes.result && simRes.result.retval) {
+      try {
+        const val = simRes.result.retval;
+        // In Soroban ABI: i128 (payout) is encoded as ScVal.scvI128
+        if (val.switch().value === xdr.ScValType.scvI128().value) {
+          const lo = val.i128().lo().toBigInt();
+          const hi = val.i128().hi().toBigInt();
+          if (lo === 0n && hi === 0n) {
+            // Simulated payout is exactly 0: short-circuit to preserve sponsor budget!
+            return null;
+          }
+        }
+      } catch (e) {
+        // Fallback: proceed if return value parsing fails
+      }
+    }
+
     let preparedTx = rpc.assembleTransaction(tx, simRes).build();
 
     // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
       const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
 
-      // In SDK v14, setSorobanData adds resourceFee to transaction fee.
-      // We initialize TransactionBuilder with base inclusion fee only:
       const restoreTxBuilder = new TransactionBuilder(restoreAccount, {
         fee: baseInclusionFee.toString(),
         networkPassphrase: this.config.networkPassphrase,
@@ -261,7 +287,6 @@ export class KallpaKeeperDaemon {
     }
 
     // 3. Strict definitive envelope budget check:
-    // preparedTx.fee reflects the complete assembled fee (base inclusion fee + Soroban resource fee).
     const definitiveEnvelopeFee = BigInt(preparedTx.fee);
     const preSendSolvency = await this.checkSponsorSolvency();
     if (preSendSolvency.availableStroops < definitiveEnvelopeFee + this.config.minSponsorReserveStroops) {
