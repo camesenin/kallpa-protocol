@@ -2,8 +2,8 @@
  * Kallpa Protocol - Autonomous Keeper Service Daemon
  *
  * Implements full coverage of claim_return, refund, and claim_secondary_recovery,
- * real position processing, per-transaction sponsor balance preservation,
- * Protocol 23 restoration fallback, and robust confirmation handling.
+ * real position processing, per-transaction sponsor balance preservation based on
+ * final assembled envelope fees, Protocol 23 restoration fallback, and robust confirmation.
  */
 
 import {
@@ -113,7 +113,6 @@ export class KallpaKeeperDaemon {
       const poolContract = new Contract(poolId);
 
       for (const target of targets) {
-        // Continuous per-transaction budget check: verify solvency before each operation
         const solvency = await this.checkSponsorSolvency();
         if (!solvency.solvent) {
           console.warn(`Sponsor reserve low (${solvency.availableStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
@@ -184,6 +183,8 @@ export class KallpaKeeperDaemon {
 
   /**
    * Universal execution pipeline with Protocol 23 state restoration and strict confirmation.
+   * Strictly verifies that available balance covers final assembled transaction envelope fee
+   * (including Soroban resource fee) while preserving the configured sponsor cushion.
    */
   private async executePermissionlessCall(
     poolContract: Contract,
@@ -212,10 +213,9 @@ export class KallpaKeeperDaemon {
     // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
       const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
-      // Total fee = Base Inclusion Fee + Resource Restoration Fee
       const totalRestoreFee = baseInclusionFee + BigInt(simRes.restorePreamble.minResourceFee);
 
-      // Verify that available balance covers restoration fee while maintaining minimum reserve
+      // Verify available balance covers restoration fee while preserving cushion
       const preRestoreSolvency = await this.checkSponsorSolvency();
       if (preRestoreSolvency.availableStroops < totalRestoreFee + this.config.minSponsorReserveStroops) {
         throw new Error(`Insufficient sponsor balance for restoration: available ${preRestoreSolvency.availableStroops} < required ${totalRestoreFee + this.config.minSponsorReserveStroops}`);
@@ -254,10 +254,14 @@ export class KallpaKeeperDaemon {
       preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 
-    // 3. Verify balance covers final invocation fee before signing
+    // 3. Strict definitive envelope budget check:
+    // preparedTx.fee reflects the complete assembled fee (base inclusion fee + Soroban resource fee).
+    const definitiveEnvelopeFee = BigInt(preparedTx.fee);
     const preSendSolvency = await this.checkSponsorSolvency();
-    if (preSendSolvency.availableStroops < baseInclusionFee + this.config.minSponsorReserveStroops) {
-      throw new Error(`Insufficient sponsor balance for invocation: available ${preSendSolvency.availableStroops} < required ${baseInclusionFee + this.config.minSponsorReserveStroops}`);
+    if (preSendSolvency.availableStroops < definitiveEnvelopeFee + this.config.minSponsorReserveStroops) {
+      throw new Error(
+        `Insufficient sponsor balance for assembled invocation: available ${preSendSolvency.availableStroops} < required ${definitiveEnvelopeFee + this.config.minSponsorReserveStroops} (fee: ${definitiveEnvelopeFee}, reserve: ${this.config.minSponsorReserveStroops})`
+      );
     }
 
     preparedTx.sign(this.sponsorKey);
@@ -307,7 +311,6 @@ export class KallpaKeeperDaemon {
         if (e.message?.includes("past 45s deadline") || e.message?.includes("execution failed")) {
           throw e;
         }
-        // Transient timeout; continue loop if budget remains
       }
 
       if (performance.now() - start + 2000 >= timeoutMs) {
