@@ -32,7 +32,8 @@ impl KallpaPoolContract {
         payer: Address,
         target_amount: i128,
         repayment_target: i128,
-        deadline: u64,
+        funding_deadline: u64,
+        repayment_deadline: u64,
         min_contribution: i128,
     ) -> Result<(), Error> {
         admin.require_auth();
@@ -43,7 +44,8 @@ impl KallpaPoolContract {
         if target_amount <= 0 || target_amount > MAX_MONETARY_CAP || repayment_target < target_amount || repayment_target > MAX_MONETARY_CAP || min_contribution <= 0 || min_contribution > target_amount {
             return Err(Error::InvalidAmount);
         }
-        if deadline <= env.ledger().timestamp() {
+        let now = env.ledger().timestamp();
+        if funding_deadline <= now || repayment_deadline <= funding_deadline {
             return Err(Error::DeadlinePassed);
         }
 
@@ -54,7 +56,8 @@ impl KallpaPoolContract {
             payer,
             target_amount,
             repayment_target,
-            deadline,
+            funding_deadline,
+            repayment_deadline,
             min_contribution,
         };
 
@@ -90,7 +93,7 @@ impl KallpaPoolContract {
         }
 
         let now = env.ledger().timestamp();
-        if now > config.deadline {
+        if now > config.funding_deadline {
             return Err(Error::DeadlinePassed);
         }
 
@@ -218,22 +221,17 @@ impl KallpaPoolContract {
         Ok(())
     }
 
-    /// Admin can explicitly declare the pool Settled if repayment was partial or compromised,
-    /// opening the pro-rata recovery claim flow for investors without blocking.
-    /// Admin can explicitly declare the pool Settled strictly if loan/escrow repayment deadline has expired
-    /// and borrower only partially repaid, safely transitioning to Settled to unblock pro-rata recovery.
-    pub fn declare_settled(env: Env, admin: Address) -> Result<(), Error> {
-        admin.require_auth();
+    /// Permissionless default declaration: Any caller (contributor, keeper or admin) can transition
+    /// the pool to Settled strictly when repayment_deadline has elapsed and borrower failed to fully repay.
+    /// Eradicates administrative lockup or griefing: funds never freeze if admin disappears.
+    pub fn declare_default(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
 
         let config: PoolConfig = env
             .storage()
             .instance()
             .get(&DataKey::Config)
             .ok_or(Error::NotInitialized)?;
-
-        if admin != config.admin {
-            return Err(Error::Unauthorized);
-        }
 
         let state: PoolState = env
             .storage()
@@ -245,12 +243,13 @@ impl KallpaPoolContract {
             return Err(Error::PoolNotFunded);
         }
 
-        // Bounded admin authority: Admin CANNOT declare early default before deadline has elapsed
+        // Must strictly be past repayment deadline
         let now = env.ledger().timestamp();
-        if now <= config.deadline {
+        if now <= config.repayment_deadline {
             return Err(Error::DeadlinePassed);
         }
 
+        // Pool transitions to Settled, freezing R and opening pro-rata claims
         env.storage().instance().set(&DataKey::State, &PoolState::Settled);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
@@ -410,7 +409,7 @@ impl KallpaPoolContract {
             .unwrap_or(PoolState::Open);
 
         let now = env.ledger().timestamp();
-        if state == PoolState::Open && now > config.deadline {
+        if state == PoolState::Open && now > config.funding_deadline {
             state = PoolState::Refundable;
             env.storage().instance().set(&DataKey::State, &PoolState::Refundable);
         }

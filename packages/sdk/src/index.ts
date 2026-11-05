@@ -10,7 +10,8 @@ export interface PoolConfig {
   payer: string;
   targetAmount: bigint;
   repaymentTarget: bigint;
-  deadline: number;
+  fundingDeadline: number;
+  repaymentDeadline: number;
   minContribution: bigint;
 }
 

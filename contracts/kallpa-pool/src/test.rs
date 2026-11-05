@@ -70,11 +70,12 @@ fn setup_test<'a>() -> TestSetup<'a> {
 fn test_successful_pool_lifecycle() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
-    let deadline = setup.env.ledger().timestamp() + 3600; // 1 hour
-    let min_contribution = 100_0000000i128; // 100 USDC
+        let min_contribution = 100_0000000i128; // 100 USDC
 
-    // 1. Initialize with repayment_target = 11,000 USDC (target 10,000 + 10% yield)
+    // 1. Initialize with repayment_target = 11,000 USDC and dual deadlines
     let repayment_target = 11_000_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400; // 24 hours later
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -82,7 +83,8 @@ fn test_successful_pool_lifecycle() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -149,10 +151,11 @@ fn test_successful_pool_lifecycle() {
 fn test_refund_on_expired_deadline() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let deadline = setup.env.ledger().timestamp() + 1000;
     let min_contribution = 100_0000000i128;
 
     let repayment_target = target;
+    let funding_deadline = setup.env.ledger().timestamp() + 1000;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -160,7 +163,8 @@ fn test_refund_on_expired_deadline() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -168,8 +172,8 @@ fn test_refund_on_expired_deadline() {
     let contrib = 3_000_0000000i128;
     setup.client.contribute(&setup.investor1, &contrib);
 
-    // Fast-forward ledger past deadline
-    setup.env.ledger().set_timestamp(deadline + 500);
+    // Fast-forward ledger past funding_deadline
+    setup.env.ledger().set_timestamp(funding_deadline + 500);
 
     // Investor 1 requests refund
     let bal_before = setup.token_client.balance(&setup.investor1);
@@ -186,10 +190,11 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
     setup.token_admin.mint(&investor3, &100_000_0000000);
 
     let target = 10_000_0000000i128; // 10,000 USDC
-    let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 1_0000000i128;
 
     let repayment_target = 11_337_7777777i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -197,7 +202,8 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -226,10 +232,11 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
 fn test_reject_multiple_deposits_per_address() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
     let repayment_target = target;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -237,7 +244,8 @@ fn test_reject_multiple_deposits_per_address() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -252,10 +260,11 @@ fn test_reject_multiple_deposits_per_address() {
 fn test_dispute_refund_flow() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
     let repayment_target = target;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -263,7 +272,8 @@ fn test_dispute_refund_flow() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -294,10 +304,11 @@ fn test_dispute_refund_flow() {
 fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
-    let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
     let repayment_target = 11_000_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -305,7 +316,8 @@ fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -358,10 +370,11 @@ fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
 fn test_admin_declare_settled_on_partial_repayment() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
     let repayment_target = 11_000_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -369,7 +382,8 @@ fn test_admin_declare_settled_on_partial_repayment() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -384,14 +398,14 @@ fn test_admin_declare_settled_on_partial_repayment() {
     assert_eq!(state_funded, PoolState::Funded);
 
     // Attempting early declare_settled before deadline must fail
-    let early_res = setup.client.try_declare_settled(&setup.admin);
+    let early_res = setup.client.try_declare_default(&setup.investor1);
     assert_eq!(early_res, Err(Ok(Error::DeadlinePassed)));
 
-    // Advance ledger past deadline to simulate loan default
-    setup.env.ledger().set_timestamp(deadline + 10);
+    // Advance ledger past repayment_deadline to simulate loan default
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
 
-    // Admin declares pool settled to release recovery funds to investors
-    setup.client.declare_settled(&setup.admin);
+    // Permissionless default declaration by contributor
+    setup.client.declare_default(&setup.investor1);
 
     let (_, state_settled, _, total_repaid) = setup.client.get_pool_info();
     assert_eq!(state_settled, PoolState::Settled);
@@ -411,10 +425,11 @@ fn test_admin_declare_settled_on_partial_repayment() {
 fn test_late_repayment_rejected_after_settled() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
-    let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
     let repayment_target = 11_000_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
@@ -422,7 +437,8 @@ fn test_late_repayment_rejected_after_settled() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 
@@ -457,7 +473,8 @@ fn test_multi_tranche_repayment_reaches_repayment_target_with_yield() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC principal
     let repayment_target = 11_000_0000000i128; // 11,000 USDC (10% agreed yield)
-    let deadline = setup.env.ledger().timestamp() + 3600;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
     let min_contribution = 100_0000000i128;
 
     setup.client.initialize(
@@ -467,7 +484,8 @@ fn test_multi_tranche_repayment_reaches_repayment_target_with_yield() {
         &setup.payer,
         &target,
         &repayment_target,
-        &deadline,
+        &funding_deadline,
+        &repayment_deadline,
         &min_contribution,
     );
 

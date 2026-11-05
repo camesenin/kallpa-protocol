@@ -20,6 +20,7 @@ pub enum Error {
     MultipleDepositsNotAllowed = 14,
     PoolNotDisputed = 15,
     PoolAlreadySettled = 16,
+    RepaymentDeadlinePassed = 17,
 }
 
 #[contracttype]
@@ -42,7 +43,8 @@ pub struct PoolConfig {
     pub payer: Address,
     pub target_amount: i128,
     pub repayment_target: i128,
-    pub deadline: u64,
+    pub funding_deadline: u64,
+    pub repayment_deadline: u64,
     pub min_contribution: i128,
 }
 

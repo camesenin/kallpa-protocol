@@ -145,6 +145,9 @@
                   "u64": "3600"
                 },
                 {
+                  "u64": "90000"
+                },
+                {
                   "i128": "10000000"
                 }
               ]
@@ -882,7 +885,7 @@
                           },
                           {
                             "key": {
-                              "symbol": "deadline"
+                              "symbol": "funding_deadline"
                             },
                             "val": {
                               "u64": "3600"
@@ -902,6 +905,14 @@
                             },
                             "val": {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "repayment_deadline"
+                            },
+                            "val": {
+                              "u64": "90000"
                             }
                           },
                           {
