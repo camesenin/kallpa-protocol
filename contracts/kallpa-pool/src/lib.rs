@@ -32,7 +32,7 @@ pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
-    fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
+        fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Ok(());
         }
@@ -44,7 +44,7 @@ impl KallpaPoolContract {
             .get(&DataKey::PendingSecondaryBuffer)
             .unwrap_or(0);
 
-        let combined = pending.checked_add(amount).ok_or(Error::MathOverflow)?;
+        let mut combined = pending.checked_add(amount).ok_or(Error::MathOverflow)?;
 
         if combined < MIN_RECOVERY_TRANCHE {
             // Below threshold: accumulate in buffer without failing or reverting repayment
@@ -52,27 +52,39 @@ impl KallpaPoolContract {
             return Ok(());
         }
 
-        // Once combined meets or exceeds MIN_RECOVERY_TRANCHE, materialize a discrete tranche
-        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+        // Materialize discrete tranches strictly capped at MAX_MONETARY_CAP
+        // Prevents cum_after * S_k from overflowing i128::MAX
+        while combined >= MIN_RECOVERY_TRANCHE {
+            let tranche_amount = if combined > MAX_MONETARY_CAP {
+                MAX_MONETARY_CAP
+            } else {
+                combined
+            };
 
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SecondaryTrancheCount)
-            .unwrap_or(0);
-        let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
-        env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-        let tranche_key = DataKey::SecondaryTranche(new_count);
-        env.storage().persistent().set(&tranche_key, &combined);
-        env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            combined = combined.checked_sub(tranche_amount).ok_or(Error::MathOverflow)?;
 
-        let total_sec: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalSecondaryAllocated)
-            .unwrap_or(0);
-        let new_total_sec = total_sec.checked_add(combined).ok_or(Error::MathOverflow)?;
-        env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+            let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+            let tranche_key = DataKey::SecondaryTranche(new_count);
+            env.storage().persistent().set(&tranche_key, &tranche_amount);
+            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+            let total_sec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalSecondaryAllocated)
+                .unwrap_or(0);
+            let new_total_sec = total_sec.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+        }
+
+        // Remaining residual (if any < MIN_RECOVERY_TRANCHE) stays safely in PendingSecondaryBuffer
+        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &combined);
         Ok(())
     }
 
