@@ -24,6 +24,9 @@ const MIN_RECOVERY_TRANCHE: i128 = 10_000_000i128; // 1.0 USDC (7 decimals)
 // Maximum tranches processed per paginated batch claim
 const MAX_BATCH_CLAIM_TRANCHES: u32 = 50;
 
+// Maximum secondary tranches materialized per transaction to strictly bound write footpint and metering
+const MAX_TRANCHES_PER_TX: u32 = 10;
+
 // Minimum cooldown period (in seconds) between manual flush calls to prevent spamming micro-tranches
 const FLUSH_COOLDOWN_SECONDS: u64 = 86400; // 24 hours
 
@@ -52,9 +55,12 @@ impl KallpaPoolContract {
             return Ok(());
         }
 
-        // Materialize discrete tranches strictly capped at MAX_MONETARY_CAP
-        // Prevents cum_after * S_k from overflowing i128::MAX
-        while combined >= MIN_RECOVERY_TRANCHE {
+        // Materialize discrete tranches strictly capped at MAX_MONETARY_CAP per tranche
+        // and bounded by MAX_TRANCHES_PER_TX to guarantee strict resource metering.
+        // Any surplus beyond MAX_TRANCHES_PER_TX * MAX_MONETARY_CAP remains in PendingSecondaryBuffer
+        // and can be incrementally materialized in subsequent transactions without reversion.
+        let mut tranches_created = 0u32;
+        while combined >= MIN_RECOVERY_TRANCHE && tranches_created < MAX_TRANCHES_PER_TX {
             let tranche_amount = if combined > MAX_MONETARY_CAP {
                 MAX_MONETARY_CAP
             } else {
@@ -62,6 +68,7 @@ impl KallpaPoolContract {
             };
 
             combined = combined.checked_sub(tranche_amount).ok_or(Error::MathOverflow)?;
+            tranches_created = tranches_created.saturating_add(1);
 
             let count: u32 = env
                 .storage()
@@ -83,7 +90,7 @@ impl KallpaPoolContract {
             env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
         }
 
-        // Remaining residual (if any < MIN_RECOVERY_TRANCHE) stays safely in PendingSecondaryBuffer
+        // Remaining unmaterialized balance safely stays in PendingSecondaryBuffer
         env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &combined);
         Ok(())
     }

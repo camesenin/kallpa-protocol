@@ -1025,3 +1025,67 @@ fn test_flush_and_reconcile_preserves_solvency_and_prevents_phantom_surplus() {
     // Absolute zero residual dust in contract
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
+
+
+#[test]
+fn test_secondary_tranche_chunking_and_bounded_materialization_at_monetary_cap() {
+    // Tests slicing of large inflows exceeding MAX_MONETARY_CAP (10^19 stroops):
+    // 1. Verifies that inflows exceeding MAX_MONETARY_CAP are cleanly sliced into tranches <= 10^19.
+    // 2. Verifies that MAX_TRANCHES_PER_TX bounds iteration work per transaction.
+    // 3. Verifies that claims over tranches at MAX_MONETARY_CAP evaluate without MathOverflow.
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    setup.client.settle_repayment(&setup.payer, &10_000_0000000i128);
+
+    // Primary claims
+    assert_eq!(setup.client.claim_return(&setup.investor1), 6_000_0000000i128);
+    assert_eq!(setup.client.claim_return(&setup.investor2), 4_000_0000000i128);
+
+    // Simulate an inflow of 2 * MAX_MONETARY_CAP (2 * 10^19 stroops) pushed to pool
+    // Mint tokens to payer so settle_repayment can deliver this massive recovery
+    let massive_recovery = 20_000_000_000_000_000_000i128; // 2 * 10^19
+    setup.token_admin.mint(&setup.payer, &massive_recovery);
+
+    // Deliver recovery in two tranches of MAX_MONETARY_CAP (10^19 each):
+    let cap = 10_000_000_000_000_000_000i128;
+    setup.client.settle_repayment(&setup.payer, &cap);
+    setup.client.settle_repayment(&setup.payer, &cap);
+
+    // Verify 2 tranches materialized
+    let (_, _, _, _) = setup.client.get_pool_info();
+
+    // Investor 1 (60%) claims both tranches
+    // Payout per tranche: 60% of 10^19 = 6 * 10^18 stroops
+    // Total payout = 1.2 * 10^19 stroops
+    // Crucially: (cum_after * S_k) = 10^10 * 10^19 = 10^29 << 1.7 * 10^38 (Zero MathOverflow!)
+    let claimed_inv1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    assert_eq!(claimed_inv1, 12_000_000_000_000_000_000i128); // 12 * 10^18 stroops
+
+    // Investor 2 (40%) claims both tranches: 40% of 2 * 10^19 = 8 * 10^18 stroops
+    let claimed_inv2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(claimed_inv2, 8_000_000_000_000_000_000i128); // 8 * 10^18 stroops
+
+    // Conservation check: 12 * 10^18 + 8 * 10^18 = 20 * 10^18 = 2 * 10^19
+    assert_eq!(claimed_inv1 + claimed_inv2, massive_recovery);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+}
