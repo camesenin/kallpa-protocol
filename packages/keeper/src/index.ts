@@ -1,8 +1,9 @@
 /**
  * Kallpa Protocol - Autonomous Keeper Service Daemon
  *
- * Implements real position discovery, simulation, Protocol 23 state restoration,
- * and fee-bumped execution for Kallpa Pools on Stellar Soroban.
+ * Implements full coverage of claim_return, refund, and claim_secondary_recovery,
+ * real position processing, sponsor balance tracking, Protocol 23 restoration fallback,
+ * and robust confirmation handling.
  */
 
 import {
@@ -12,6 +13,7 @@ import {
   Contract,
   Operation,
   Address,
+  xdr,
 } from "@stellar/stellar-sdk";
 
 export interface KeeperConfig {
@@ -20,6 +22,13 @@ export interface KeeperConfig {
   sponsorSecret: string;
   poolContractIds: string[];
   maxTranchesPerBatch: number;
+  minSponsorReserveXlm: number; // e.g. 5 XLM safety threshold
+}
+
+export interface InvestorClaimTarget {
+  investor: string;
+  action: "claim_return" | "refund" | "claim_secondary";
+  maxTranches?: number;
 }
 
 export class KallpaKeeperDaemon {
@@ -34,52 +43,116 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Monitor registered pools and disburse pending claims permissionlessly.
+   * Check sponsor XLM balance to ensure sufficient gas coverage.
    */
-  async runSweepCycle(indexedPositions: Map<string, string[]>): Promise<{ processed: number; errors: number }> {
-    let processed = 0;
-    let errors = 0;
-
-    for (const poolId of this.config.poolContractIds) {
-      try {
-        const poolContract = new Contract(poolId);
-        const investors = indexedPositions.get(poolId) || [];
-
-        for (const investor of investors) {
-          try {
-            await this.disburseInvestorClaim(poolContract, investor);
-            processed++;
-          } catch (err) {
-            console.error(`Failed disbursal for investor ${investor} in pool ${poolId}:`, err);
-            errors++;
-          }
-        }
-      } catch (err) {
-        console.error(`Error sweeping pool ${poolId}:`, err);
-        errors++;
+  async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceXlm: number }> {
+    const account = await this.server.getAccount(this.sponsorKey.publicKey());
+    // Find native balance
+    let nativeBalance = 0;
+    for (const b of (account as any).balances || []) {
+      if (b.asset_type === "native") {
+        nativeBalance = parseFloat(b.balance);
       }
     }
-
-    return { processed, errors };
+    return {
+      solvent: nativeBalance >= this.config.minSponsorReserveXlm,
+      balanceXlm: nativeBalance,
+    };
   }
 
   /**
-   * Disburse claim for an investor using Protocol 23 automatic restoration and fee-bumping.
+   * Monitor registered pools and disburse pending claims permissionlessly
+   * across all three protocol claiming routes.
    */
-  async disburseInvestorClaim(poolContract: Contract, investor: string): Promise<string> {
+  async runSweepCycle(
+    targetsByPool: Map<string, InvestorClaimTarget[]>
+  ): Promise<{ processed: number; errors: number; skippedForLowFunds: boolean }> {
+    let processed = 0;
+    let errors = 0;
+
+    const solvency = await this.checkSponsorSolvency();
+    if (!solvency.solvent) {
+      console.warn(`Sponsor reserve low (${solvency.balanceXlm} XLM < ${this.config.minSponsorReserveXlm} XLM). Pausing sweep.`);
+      return { processed: 0, errors: 0, skippedForLowFunds: true };
+    }
+
+    for (const poolId of this.config.poolContractIds) {
+      const targets = targetsByPool.get(poolId) || [];
+      const poolContract = new Contract(poolId);
+
+      for (const target of targets) {
+        try {
+          if (target.action === "claim_return") {
+            await this.disburseClaimReturn(poolContract, target.investor);
+          } else if (target.action === "refund") {
+            await this.disburseRefund(poolContract, target.investor);
+          } else if (target.action === "claim_secondary") {
+            await this.disburseSecondaryRecovery(
+              poolContract,
+              target.investor,
+              target.maxTranches || this.config.maxTranchesPerBatch
+            );
+          }
+          processed++;
+        } catch (err) {
+          console.error(`Failed disbursing ${target.action} for ${target.investor}:`, err);
+          errors++;
+        }
+      }
+    }
+
+    return { processed, errors, skippedForLowFunds: false };
+  }
+
+  /**
+   * Route 1: Disburse primary claim_return
+   */
+  async disburseClaimReturn(poolContract: Contract, investor: string): Promise<string> {
+    return this.executePermissionlessCall(poolContract, "claim_return", [
+      new Address(investor).toScVal(),
+    ]);
+  }
+
+  /**
+   * Route 2: Disburse refund on expired pool
+   */
+  async disburseRefund(poolContract: Contract, investor: string): Promise<string> {
+    return this.executePermissionlessCall(poolContract, "refund", [
+      new Address(investor).toScVal(),
+    ]);
+  }
+
+  /**
+   * Route 3: Disburse secondary recovery tranche
+   */
+  async disburseSecondaryRecovery(
+    poolContract: Contract,
+    investor: string,
+    maxTranches: number
+  ): Promise<string> {
+    const tranchesVal = xdr.ScVal.scvU32(maxTranches);
+    const optVal = xdr.ScVal.scvVec([tranchesVal]); // Option::Some(maxTranches)
+    return this.executePermissionlessCall(poolContract, "claim_secondary_recovery", [
+      new Address(investor).toScVal(),
+      optVal,
+    ]);
+  }
+
+  /**
+   * Universal execution pipeline with Protocol 23 state restoration and strict confirmation.
+   */
+  private async executePermissionlessCall(
+    poolContract: Contract,
+    method: string,
+    args: xdr.ScVal[]
+  ): Promise<string> {
     const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
 
-    // Construct permissionless claim_return invocation
     const tx = new TransactionBuilder(sponsorAccount, {
-      fee: "100000", // Base fee allowance (stroops)
+      fee: "100000",
       networkPassphrase: this.config.networkPassphrase,
     })
-      .addOperation(
-        poolContract.call(
-          "claim_return",
-          new Address(investor).toScVal()
-        )
-      )
+      .addOperation(poolContract.call(method, ...args))
       .setTimeout(30)
       .build();
 
@@ -89,24 +162,18 @@ export class KallpaKeeperDaemon {
       throw new Error(`Simulation failed: ${simRes.error}`);
     }
 
-    // 2. Protocol 23 Auto-Restoration & Footprint Handling:
-    // If state entries are archived, simulateTransaction populates restorePreamble
-    // or archivedSorobanEntries within the SorobanTransactionData.
     let preparedTx = rpc.assembleTransaction(tx, simRes).build();
 
-    // 3. Fallback: If standalone RestoreFootprintOp is required by restorePreamble
+    // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
       const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const restoreTxBuilder = new TransactionBuilder(restoreAccount, {
         fee: simRes.restorePreamble.minResourceFee,
         networkPassphrase: this.config.networkPassphrase,
       })
-        .addOperation(
-          Operation.restoreFootprint({})
-        )
+        .addOperation(Operation.restoreFootprint({}))
         .setTimeout(30);
 
-      // Crucial: Set sorobanData containing footprint & resources from restorePreamble
       if (simRes.restorePreamble.transactionData) {
         restoreTxBuilder.setSorobanData(simRes.restorePreamble.transactionData.build());
       }
@@ -117,24 +184,23 @@ export class KallpaKeeperDaemon {
       if (restoreSendRes.status === "ERROR") {
         throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
       }
-      
-      // Wait for strict SUCCESS on-chain confirmation before proceeding
+
       await this.waitForConfirmation(restoreSendRes.hash);
-      
-      // Re-fetch sponsor account and re-simulate invocation
+
+      // Re-fetch sequence and re-simulate
       const freshAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const freshTx = new TransactionBuilder(freshAccount, {
         fee: "100000",
         networkPassphrase: this.config.networkPassphrase,
       })
-        .addOperation(poolContract.call("claim_return", new Address(investor).toScVal()))
+        .addOperation(poolContract.call(method, ...args))
         .setTimeout(30)
         .build();
       const freshSim = await this.server.simulateTransaction(freshTx);
       preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 
-    // 4. Sign with sponsor key and submit
+    // 3. Sign with sponsor key and submit
     preparedTx.sign(this.sponsorKey);
     const sendRes = await this.server.sendTransaction(preparedTx);
 
@@ -147,23 +213,22 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Poll RPC getTransaction until final inclusion status.
-   * Strictly verifies SUCCESS; fails on timeout or non-SUCCESS status.
+   * Poll RPC getTransaction with wall-clock timeout and strict SUCCESS verification.
    */
   private async waitForConfirmation(txHash: string): Promise<void> {
-    let attempts = 15;
-    while (attempts > 0) {
+    const startTime = Date.now();
+    const timeoutMs = 45000; // 45s wall-clock timeout
+
+    while (Date.now() - startTime < timeoutMs) {
       const res = await this.server.getTransaction(txHash);
       if (res.status === "SUCCESS") {
         return;
       }
       if (res.status === "FAILED") {
-        throw new Error(`Transaction ${txHash} execution failed`);
+        throw new Error(`Transaction ${txHash} execution failed on-chain`);
       }
-      // NOT_FOUND or STILL_PENDING: wait and retry
       await new Promise((r) => setTimeout(r, 2000));
-      attempts--;
     }
-    throw new Error(`Transaction ${txHash} confirmation timed out after 30 seconds`);
+    throw new Error(`Transaction ${txHash} confirmation timed out after ${timeoutMs}ms`);
   }
 }
