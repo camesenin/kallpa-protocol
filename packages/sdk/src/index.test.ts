@@ -48,7 +48,7 @@ describe("@kallpa/sdk", () => {
     expect(calculateRemainingCapacity(1000n, 1200n)).toBe(0n);
   });
 
-  it("validates contribution clamping to remaining capacity", () => {
+  it("validates contribution clamping to remaining capacity and rejects dust remnants", () => {
     const res = validateContribution(500n, 100n, 300n);
     expect(res.valid).toBe(true);
     expect(res.actualAmount).toBe(300n);
@@ -56,6 +56,11 @@ describe("@kallpa/sdk", () => {
     const invalidMin = validateContribution(50n, 100n, 300n);
     expect(invalidMin.valid).toBe(false);
     expect(invalidMin.error).toContain("below minimum ticket");
+
+    // Clamped remainder below minContribution must be rejected to prevent stranded dust
+    const dustClamped = validateContribution(500n, 100n, 50n);
+    expect(dustClamped.valid).toBe(false);
+    expect(dustClamped.error).toContain("below minimum ticket");
   });
 
   it("formats and parses units strictly", () => {

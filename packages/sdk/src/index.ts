@@ -103,6 +103,13 @@ export function validateContribution(
   }
 
   const actualAmount = amount > remainingCapacity ? remainingCapacity : amount;
+  if (actualAmount < minContribution) {
+    return {
+      valid: false,
+      actualAmount: 0n,
+      error: `Clamped contribution (${actualAmount.toString()}) is below minimum ticket (${minContribution.toString()})`,
+    };
+  }
   return { valid: true, actualAmount };
 }
 

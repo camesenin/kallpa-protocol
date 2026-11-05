@@ -1173,3 +1173,45 @@ fn test_flush_secondary_buffer_slices_at_max_monetary_cap_preventing_overflow() 
     // Step 7: Contract token balance strictly 0 (absolute conservation)
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
+
+#[test]
+fn test_min_contribution_enforcement_and_dust_clamping_rejection() {
+    let setup = setup_test();
+    let target = 1_000_0000000i128; // 1,000 USDC
+    let min_contribution = 10_0000000i128; // 10 USDC minimum ticket
+    let repayment_target = target;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // 1. Initial sub-minimum deposit is strictly rejected (e.g. 5 USDC < 10 USDC)
+    let res_low = setup.client.try_contribute(&setup.investor1, &5_0000000i128);
+    assert_eq!(res_low, Err(Ok(Error::InvalidAmount)));
+
+    // 2. Investor 1 contributes 995 USDC (leaving only 5 USDC remaining capacity)
+    let c1 = 995_0000000i128;
+    assert_eq!(setup.client.contribute(&setup.investor1, &c1), c1);
+
+    // 3. Investor 2 attempts to contribute 20 USDC.
+    // Clamping to remaining capacity would yield 5 USDC (< min_contribution of 10 USDC).
+    // The contract strictly rejects this with InvalidAmount to prevent micro-dust stranded entries!
+    let res_clamped_dust = setup.client.try_contribute(&setup.investor2, &20_0000000i128);
+    assert_eq!(res_clamped_dust, Err(Ok(Error::InvalidAmount)));
+
+    // 4. Investor 3 attempts to contribute 5 USDC. Directly rejected as well.
+    let investor3 = Address::generate(&setup.env);
+    setup.token_admin.mint(&investor3, &100_000_0000000);
+    let res_direct_dust = setup.client.try_contribute(&investor3, &5_0000000i128);
+    assert_eq!(res_direct_dust, Err(Ok(Error::InvalidAmount)));
+}

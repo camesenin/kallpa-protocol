@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | **Stellar Testnet** | CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX | [Stellar.Expert](https://stellar.expert/explorer/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) · [Stellar Lab](https://lab.stellar.org/r/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) |
 | **Deployer** | GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E | [Stellar.Expert](https://stellar.expert/explorer/testnet/account/GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E) |
-| **WASM Hash** | b90900a7374b1c91f54ee96211f51c2a646351f79fa362898655d9a65595ab1a (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 28 / Soroban v28 |
+| **WASM Hash** | b2d7527941579f22b127d3890eff49da9254d0e32988e4b4923e04872b80e8c3 (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 28 / Soroban v28 |
 
 ---
 
@@ -71,7 +71,9 @@ flowchart TD
    - **Formal State Machine:** `Open` → `Funded` → `Settled` (with automatic transition to `Refundable` upon expired deadline).
    - **Segregated Storage & TTL Management:** Global pool parameters are stored in `Instance` storage; individual participant balances live in `Persistent` storage with explicit TTL extensions (`env.storage().persistent().extend_ttl()`).
    - **Pull-Payment Pattern (DoS Defense):** To prevent unbounded transaction sizes or exceeding Soroban's CPU/memory execution metering, settlement and refunds are never pushed in loops. Instead, state transitions occur in $O(1)$, and participants pull their entitlement individually via `claim()`.
-   - **Collapsed Deposit Slices:** Multiple deposits from the same account collapse into a single position entry, bounding contract footprint and gas requirements.
+   - **Strict Per-Address Position Model (Phase 0):** In the Phase 0 prototype, accounts are limited to one contribution per address to guarantee exact zero-dust telescoping intervals. Multi-slice non-contiguous deposits collapsing up to 16 deposit slices per address are explicitly scheduled for Milestone 1.
+   - **Ticket Sizing & Anti-Dust Clamping Economics:** `min_contribution` is strictly enforced at initialization and contribution time. Crucially, when a contributor deposits into a pool whose remaining capacity is smaller than `min_contribution`, or when contribution clamping would produce an effective deposit below `min_contribution`, the contract strictly rejects the transaction with `Error::InvalidAmount`. This prevents stranded sub-cent positions whose claiming fees on Soroban would exceed the recoverable balance.
+   - **Soroban State Archival & Storage Rent Management:** Global pool metadata lives in `Instance` storage (bumped by 30 days when within 7 days). Contributor positions and discrete secondary recovery tranches live in `Persistent` storage (bumped by 60 days when within 14 days) across all claim and recovery operations, ensuring protocol entries are never unexpectedly archived.
 
 2. **Trustless Work Interoperability:**
    - Downstream integration with Trustless Work escrow contracts (`github.com/Trustless-Work/trustlesswork-smart-contract-stellar`).
@@ -126,7 +128,7 @@ SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2=1 cargo build --target wasm32v
 ```bash
 cargo test --workspace
 ```
-*Current test suite: 18 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, and post-default secondary recovery flow with multiple recovery tranches).*
+*Current test suite: 19 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, post-default secondary recovery flow with multiple recovery tranches, and min_contribution enforcement with dust clamping rejection).*
 
 ### 3. Run TypeScript SDK Tests
 ```bash

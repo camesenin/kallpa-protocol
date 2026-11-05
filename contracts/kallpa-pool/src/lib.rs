@@ -144,7 +144,7 @@ impl KallpaPoolContract {
 
     /// Contributor contributes USDC to the pool.
     /// In Phase 0 prototype, accounts are limited to one contribution per address to guarantee exact zero-dust telescoping intervals.
-    /// Multi-slice non-contiguous deposits are planned for Milestone 1.
+    /// Multi-slice non-contiguous deposits are planned for Milestone 1 (collapsing up to 16 deposit slices per address).
     pub fn contribute(env: Env, investor: Address, amount: i128) -> Result<i128, Error> {
         investor.require_auth();
 
@@ -195,6 +195,9 @@ impl KallpaPoolContract {
         }
 
         let actual_contribution = if amount > remaining { remaining } else { amount };
+        if actual_contribution < config.min_contribution {
+            return Err(Error::InvalidAmount);
+        }
 
         // Pull funds from contributor to pool contract
         let token_client = token::Client::new(&env, &config.asset);
