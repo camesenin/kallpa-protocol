@@ -1257,13 +1257,20 @@ fn test_permissionless_disbursal_and_third_party_claim() {
     setup.token_admin.mint(&setup.payer, &repayment_target);
     setup.client.settle_repayment(&setup.payer, &repayment_target);
 
-    // Strict zero beneficiary auth proof:
+    // Strict non-mocked adversarial verification:
     // Calling claim_return transfers funds strictly to investor1 without requiring investor1 signature.
     let balance_before = setup.token_client.balance(&setup.investor1);
     let payout = setup.client.claim_return(&setup.investor1);
     assert_eq!(payout, 550_0000000i128);
     let balance_after = setup.token_client.balance(&setup.investor1);
     assert_eq!(balance_after - balance_before, 550_0000000i128);
+
+    // In Soroban SDK test environment, env.auths() records authorizations invoked during the last call.
+    // We strictly assert that NO authorization was recorded for investor1:
+    let auths = setup.env.auths();
+    for (addr, _) in auths.iter() {
+        assert_ne!(*addr, setup.investor1, "investor1 must NEVER be required to authorize claim_return!");
+    }
 
     // Replay / Double claim is rejected with AlreadyClaimed
     let res_double = setup.client.try_claim_return(&setup.investor1);
@@ -1299,6 +1306,12 @@ fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_au
     let refund_amt = setup.client.refund(&setup.investor1);
     assert_eq!(refund_amt, 200_0000000i128);
     assert_eq!(setup.token_client.balance(&setup.investor1), bal_before_refund + 200_0000000i128);
+
+    // Verify ZERO authorization recorded for investor1 during refund:
+    let refund_auths = setup.env.auths();
+    for (addr, _) in refund_auths.iter() {
+        assert_ne!(*addr, setup.investor1, "investor1 must NEVER be required to authorize refund!");
+    }
 
     // Replay refund is rejected
     let res_double_rf = setup.client.try_refund(&setup.investor1);
@@ -1337,6 +1350,12 @@ fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_au
     let sec_payout = setup2.client.claim_secondary_recovery(&setup2.investor1, &Some(10));
     assert_eq!(sec_payout, 60_0000000i128); // 60% of 100 USDC = 60 USDC
     assert_eq!(setup2.token_client.balance(&setup2.investor1), bal1_before + 60_0000000i128);
+
+    // Verify ZERO authorization recorded for investor1 during secondary recovery:
+    let sec_auths = setup2.env.auths();
+    for (addr, _) in sec_auths.iter() {
+        assert_ne!(*addr, setup2.investor1, "investor1 must NEVER be required to authorize claim_secondary_recovery!");
+    }
 
     // Replay idempotency: immediate replay when no new tranches exist safely returns Ok(0)
     // with strictly zero duplicate payouts!

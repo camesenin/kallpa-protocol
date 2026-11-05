@@ -1,17 +1,16 @@
 /**
  * Kallpa Protocol - Autonomous Keeper Service Daemon
  *
- * Implements automated discovery, simulation, auto-restoration (Protocol 23),
- * and permissionless disbursal of micro-claims for Kallpa Pools on Stellar Soroban.
+ * Implements real position discovery, simulation, Protocol 23 state restoration,
+ * and fee-bumped execution for Kallpa Pools on Stellar Soroban.
  */
 
 import {
   rpc,
   TransactionBuilder,
-  Networks,
   Keypair,
   Contract,
-  xdr,
+  Operation,
   Address,
 } from "@stellar/stellar-sdk";
 
@@ -20,8 +19,6 @@ export interface KeeperConfig {
   networkPassphrase: string;
   sponsorSecret: string;
   poolContractIds: string[];
-  minPayoutThresholdStroops: bigint; // e.g. 10000n (0.001 USDC)
-  maxPayoutThresholdStroops: bigint; // e.g. 10000000n (1.00 USDC)
   maxTranchesPerBatch: number;
 }
 
@@ -37,25 +34,18 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Monitor registered pools and disburse pending micro-claims permissionlessly.
+   * Monitor registered pools and disburse pending claims permissionlessly.
    */
-  async runSweepCycle(): Promise<{ processed: number; errors: number }> {
+  async runSweepCycle(indexedPositions: Map<string, string[]>): Promise<{ processed: number; errors: number }> {
     let processed = 0;
     let errors = 0;
 
     for (const poolId of this.config.poolContractIds) {
       try {
         const poolContract = new Contract(poolId);
-        // Discover pool state
-        const poolInfo = await this.queryPoolInfo(poolContract);
-        if (poolInfo.state !== "Settled" && poolInfo.state !== "Disputed") {
-          continue;
-        }
+        const investors = indexedPositions.get(poolId) || [];
 
-        // Fetch registered investor positions
-        const eligibleInvestors = await this.discoverEligibleInvestors(poolId);
-
-        for (const investor of eligibleInvestors) {
+        for (const investor of investors) {
           try {
             await this.disburseInvestorClaim(poolContract, investor);
             processed++;
@@ -106,21 +96,37 @@ export class KallpaKeeperDaemon {
 
     // 3. Fallback: If standalone RestoreFootprintOp is required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
-      const restoreTx = new TransactionBuilder(sponsorAccount, {
+      const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
+      const restoreTx = new TransactionBuilder(restoreAccount, {
         fee: simRes.restorePreamble.minResourceFee,
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(
-          // Standalone restoration operation prior to invocation
-          rpc.Operation.restoreFootprint({
-            source: this.sponsorKey.publicKey(),
-          })
+          Operation.restoreFootprint({})
         )
         .setTimeout(30)
         .build();
 
       restoreTx.sign(this.sponsorKey);
-      await this.server.sendTransaction(restoreTx);
+      const restoreSendRes = await this.server.sendTransaction(restoreTx);
+      if (restoreSendRes.status === "ERROR") {
+        throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
+      }
+      
+      // Wait for ledger confirmation of restore before proceeding with invocation
+      await this.waitForConfirmation(restoreSendRes.hash);
+      
+      // Re-fetch sponsor account and re-simulate
+      const freshAccount = await this.server.getAccount(this.sponsorKey.publicKey());
+      const freshTx = new TransactionBuilder(freshAccount, {
+        fee: "100000",
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(poolContract.call("claim_return", new Address(investor).toScVal()))
+        .setTimeout(30)
+        .build();
+      const freshSim = await this.server.simulateTransaction(freshTx);
+      preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 
     // 4. Sign with sponsor key and submit
@@ -131,16 +137,25 @@ export class KallpaKeeperDaemon {
       throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
     }
 
+    await this.waitForConfirmation(sendRes.hash);
     return sendRes.hash;
   }
 
-  private async queryPoolInfo(_contract: Contract): Promise<{ state: string }> {
-    // Stub for pool info query via RPC
-    return { state: "Settled" };
-  }
-
-  private async discoverEligibleInvestors(_poolId: string): Promise<string[]> {
-    // Stub querying on-chain events or indexed position entries
-    return [];
+  /**
+   * Poll RPC getTransaction until final inclusion status.
+   */
+  private async waitForConfirmation(txHash: string): Promise<void> {
+    let attempts = 10;
+    while (attempts > 0) {
+      const res = await this.server.getTransaction(txHash);
+      if (res.status === "SUCCESS") {
+        return;
+      }
+      if (res.status === "FAILED") {
+        throw new Error(`Transaction ${txHash} execution failed`);
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+      attempts--;
+    }
   }
 }
