@@ -1089,3 +1089,63 @@ fn test_secondary_tranche_chunking_and_bounded_materialization_at_monetary_cap()
     assert_eq!(claimed_inv1 + claimed_inv2, massive_recovery);
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
+
+
+#[test]
+fn test_flush_secondary_buffer_slices_at_max_monetary_cap_preventing_overflow() {
+    // Verifies hostile Council finding:
+    // When PendingSecondaryBuffer contains an amount exceeding MAX_MONETARY_CAP (e.g. 2 * 10^19 stroops),
+    // flush_secondary_buffer MUST NOT create a single massive tranche of 2 * 10^19!
+    // It must slice into tranches <= MAX_MONETARY_CAP (10^19).
+    // Claims by a participant with cum_after = total_collected = 10^19 MUST NOT panic with MathOverflow!
+    let setup = setup_test();
+    let cap = 10_000_000_000_000_000_000i128; // 10^19 stroops
+    let target = cap;
+    let repayment_target = cap;
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Contributor 1 deposits 10^19 (100% of capacity, maximum possible cum_after!)
+    setup.token_admin.mint(&setup.investor1, &cap);
+    setup.client.contribute(&setup.investor1, &cap);
+
+    // Payer repays target of 10^19 -> Settled
+    setup.token_admin.mint(&setup.payer, &cap);
+    setup.client.settle_repayment(&setup.payer, &cap);
+
+    // Contributor claims primary return of 10^19
+    assert_eq!(setup.client.claim_return(&setup.investor1), cap);
+
+    // Now simulate an inflow of 2 * 10^19 entering PendingSecondaryBuffer via direct push
+    let massive_surplus = 2 * cap; // 2 * 10^19
+    setup.token_admin.mint(&setup.tw_escrow, &massive_surplus);
+    setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &massive_surplus);
+
+    // Advance past repayment deadline and reconcile
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
+    let rec = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(rec, massive_surplus);
+
+    // Tranches materialized by record_secondary_tranche:
+    // Because MAX_TRANCHES_PER_TX = 10 and amount = 2 * 10^19, it slices into exactly 2 tranches of 10^19!
+    // Contributor claims secondary recovery:
+    // Each tranche is 10^19. cum_after is 10^19.
+    // Product: cum_after * S_k = 10^19 * 10^19 = 10^38 < i128::MAX (approx 1.7 * 10^38).
+    // MUST NOT overflow!
+    let claimed_sec = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    assert_eq!(claimed_sec, massive_surplus);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+}

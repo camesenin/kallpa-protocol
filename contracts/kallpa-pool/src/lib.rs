@@ -721,7 +721,7 @@ impl KallpaPoolContract {
             return Err(Error::PoolNotSettled);
         }
 
-        let pending: i128 = env
+        let mut pending: i128 = env
             .storage()
             .instance()
             .get(&DataKey::PendingSecondaryBuffer)
@@ -744,31 +744,47 @@ impl KallpaPoolContract {
             }
         }
 
-        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
         env.storage().instance().set(&DataKey::LastFlushTimestamp, &now);
 
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SecondaryTrancheCount)
-            .unwrap_or(0);
-        let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
-        env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-        let tranche_key = DataKey::SecondaryTranche(new_count);
-        env.storage().persistent().set(&tranche_key, &pending);
-        env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        // Bounded materialization strictly respecting MAX_MONETARY_CAP per tranche and MAX_TRANCHES_PER_TX
+        let mut total_flushed: i128 = 0;
+        let mut tranches_created = 0u32;
 
-        let total_sec: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalSecondaryAllocated)
-            .unwrap_or(0);
-        let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
-        env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+        while pending > 0 && tranches_created < MAX_TRANCHES_PER_TX {
+            let tranche_amount = if pending > MAX_MONETARY_CAP {
+                MAX_MONETARY_CAP
+            } else {
+                pending
+            };
 
+            pending = pending.checked_sub(tranche_amount).ok_or(Error::MathOverflow)?;
+            total_flushed = total_flushed.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
+            tranches_created = tranches_created.saturating_add(1);
+
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+            let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+            let tranche_key = DataKey::SecondaryTranche(new_count);
+            env.storage().persistent().set(&tranche_key, &tranche_amount);
+            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+            let total_sec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalSecondaryAllocated)
+                .unwrap_or(0);
+            let new_total_sec = total_sec.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+        }
+
+        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &pending);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        Ok(pending)
+        Ok(total_flushed)
     }
 
     /// Autonomous onchain reconciliation of funds returned directly by Trustless Work or external escrow.
