@@ -213,16 +213,11 @@ export class KallpaKeeperDaemon {
     // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
       const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
-      const totalRestoreFee = baseInclusionFee + BigInt(simRes.restorePreamble.minResourceFee);
 
-      // Verify available balance covers restoration fee while preserving cushion
-      const preRestoreSolvency = await this.checkSponsorSolvency();
-      if (preRestoreSolvency.availableStroops < totalRestoreFee + this.config.minSponsorReserveStroops) {
-        throw new Error(`Insufficient sponsor balance for restoration: available ${preRestoreSolvency.availableStroops} < required ${totalRestoreFee + this.config.minSponsorReserveStroops}`);
-      }
-
+      // In SDK v14, setSorobanData adds resourceFee to transaction fee.
+      // We initialize TransactionBuilder with base inclusion fee only:
       const restoreTxBuilder = new TransactionBuilder(restoreAccount, {
-        fee: totalRestoreFee.toString(),
+        fee: baseInclusionFee.toString(),
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(Operation.restoreFootprint({}))
@@ -232,7 +227,18 @@ export class KallpaKeeperDaemon {
         restoreTxBuilder.setSorobanData(simRes.restorePreamble.transactionData.build());
       }
 
+      // Build envelope FIRST to obtain definitive total fee
       const restoreTx = restoreTxBuilder.build();
+      const definitiveRestoreFee = BigInt(restoreTx.fee);
+
+      // Verify definitive envelope fee against available balance
+      const preRestoreSolvency = await this.checkSponsorSolvency();
+      if (preRestoreSolvency.availableStroops < definitiveRestoreFee + this.config.minSponsorReserveStroops) {
+        throw new Error(
+          `Insufficient sponsor balance for definitive restoration envelope: available ${preRestoreSolvency.availableStroops} < required ${definitiveRestoreFee + this.config.minSponsorReserveStroops} (fee: ${definitiveRestoreFee}, reserve: ${this.config.minSponsorReserveStroops})`
+        );
+      }
+
       restoreTx.sign(this.sponsorKey);
       const restoreSendRes = await this.server.sendTransaction(restoreTx);
       if (restoreSendRes.status === "ERROR") {
@@ -241,7 +247,7 @@ export class KallpaKeeperDaemon {
 
       await this.waitForConfirmation(restoreSendRes.hash);
 
-      // Re-fetch sequence and re-simulate
+      // Re-fetch sequence and re-simulate invocation
       const freshAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const freshTx = new TransactionBuilder(freshAccount, {
         fee: baseInclusionFee.toString(),
@@ -284,7 +290,10 @@ export class KallpaKeeperDaemon {
     const timeoutMs = 45000; // Strict 45s monotonic deadline
 
     while (performance.now() - start < timeoutMs) {
-      const remainingTime = Math.max(100, Math.floor(timeoutMs - (performance.now() - start)));
+      const remainingTime = Math.max(0, Math.floor(timeoutMs - (performance.now() - start)));
+      if (remainingTime === 0) {
+        break;
+      }
       let timerId: any;
 
       const callPromise = this.server.getTransaction(txHash);
