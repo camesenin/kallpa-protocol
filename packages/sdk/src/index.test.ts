@@ -61,6 +61,21 @@ describe("@kallpa/sdk", () => {
     const dustClamped = validateContribution(500n, 100n, 50n);
     expect(dustClamped.valid).toBe(false);
     expect(dustClamped.error).toContain("below minimum ticket");
+    // Parity verification with Soroban pool viability guard:
+    // Case 1: Residue zero (exact fill) -> VALID
+    const fillExact = validateContribution(100n, 10n, 100n);
+    expect(fillExact.valid).toBe(true);
+    expect(fillExact.actualAmount).toBe(100n);
+
+    // Case 2: Residue equal to minimum (remaining_after == minContribution) -> VALID
+    const leaveMin = validateContribution(90n, 10n, 100n);
+    expect(leaveMin.valid).toBe(true);
+    expect(leaveMin.actualAmount).toBe(90n);
+
+    // Case 3: Subminimum residue (remaining_after < minContribution, e.g. 95n leaving 5n < 10n) -> REJECTED
+    const leaveSubMin = validateContribution(95n, 10n, 100n);
+    expect(leaveSubMin.valid).toBe(false);
+    expect(leaveSubMin.error).toContain("leaves unfillable stranded capacity");
   });
 
   it("formats and parses units strictly", () => {

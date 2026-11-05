@@ -110,6 +110,17 @@ export function validateContribution(
       error: `Clamped contribution (${actualAmount.toString()}) is below minimum ticket (${minContribution.toString()})`,
     };
   }
+
+  // Viability invariant: remaining capacity after contribution must either be 0 (filling pool)
+  // or at least minContribution to prevent leaving stranded unfillable residual capacity.
+  const remainingAfter = remainingCapacity - actualAmount;
+  if (remainingAfter > 0n && remainingAfter < minContribution) {
+    return {
+      valid: false,
+      actualAmount: 0n,
+      error: `Contribution leaves unfillable stranded capacity (${remainingAfter.toString()}) below minimum ticket (${minContribution.toString()})`,
+    };
+  }
   return { valid: true, actualAmount };
 }
 

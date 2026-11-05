@@ -1257,11 +1257,50 @@ fn test_permissionless_disbursal_and_third_party_claim() {
     setup.token_admin.mint(&setup.payer, &repayment_target);
     setup.client.settle_repayment(&setup.payer, &repayment_target);
 
-    // Disbursal is completely permissionless: investor1 does not need to sign!
-    // A keeper or third-party can trigger claim_return for investor1 directly.
+    // Strict zero beneficiary auth proof:
+    // Calling claim_return transfers funds strictly to investor1 without requiring investor1 signature.
     let balance_before = setup.token_client.balance(&setup.investor1);
     let payout = setup.client.claim_return(&setup.investor1);
     assert_eq!(payout, 550_0000000i128);
     let balance_after = setup.token_client.balance(&setup.investor1);
     assert_eq!(balance_after - balance_before, 550_0000000i128);
+
+    // Replay / Double claim is rejected with AlreadyClaimed
+    let res_double = setup.client.try_claim_return(&setup.investor1);
+    assert_eq!(res_double, Err(Ok(Error::AlreadyClaimed)));
+}
+
+#[test]
+fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_auth() {
+    let setup = setup_test();
+    let target = 1_000_0000000i128;
+    let min_contribution = 10_0000000i128;
+    let repayment_target = 1_100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // 1. Permissionless refund on deadline expiry
+    setup.client.contribute(&setup.investor1, &200_0000000i128);
+    setup.env.ledger().set_timestamp(funding_deadline + 10);
+
+    let bal_before_refund = setup.token_client.balance(&setup.investor1);
+    let refund_amt = setup.client.refund(&setup.investor1);
+    assert_eq!(refund_amt, 200_0000000i128);
+    assert_eq!(setup.token_client.balance(&setup.investor1), bal_before_refund + 200_0000000i128);
+
+    // Replay refund is rejected
+    let res_double_rf = setup.client.try_refund(&setup.investor1);
+    assert_eq!(res_double_rf, Err(Ok(Error::AlreadyClaimed)));
 }
