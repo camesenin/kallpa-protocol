@@ -43,34 +43,44 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Check sponsor XLM balance using on-chain ledger entries via RPC getLedgerEntries.
-   * Parses AccountEntry to inspect exact native balance in stroops without Horizon dependency.
+   * Check sponsor XLM available balance using on-chain ledger entries via RPC getLedgerEntries.
+   * Passes accountKey as a direct parameter (rest parameter syntax in SDK v14) and accesses entry.val.
+   * Calculates available balance by subtracting minimum reserve from total balance.
    */
-  async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceStroops: bigint }> {
+  async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceStroops: bigint; availableStroops: bigint }> {
     try {
       const accountId = this.sponsorKey.xdrAccountId();
       const accountKey = xdr.LedgerKey.account(
         new xdr.LedgerKeyAccount({ accountId })
       );
 
-      const res = await this.server.getLedgerEntries([accountKey]);
+      // In SDK v14 getLedgerEntries accepts keys as separate arguments (...keys)
+      const res = await this.server.getLedgerEntries(accountKey);
       if (res.entries && res.entries.length > 0) {
         const entry = res.entries[0];
-        const leData = xdr.LedgerEntryData.fromXDR(entry.xdr, "base64");
-        const balance = leData.account().balance().toBigInt();
+        // entry.val contains the parsed xdr.LedgerEntryData
+        const accountEntry = entry.val.account();
+        const totalBalance = accountEntry.balance().toBigInt();
+        const subentryCount = BigInt(accountEntry.numSubentries());
+        // Standard Stellar reserve math: base reserve = 0.5 XLM (5_000_000 stroops)
+        // Min reserve = (2 + numSubentries) * baseReserve
+        const minReserve = (2n + subentryCount) * 5_000_000n;
+        const available = totalBalance > minReserve ? totalBalance - minReserve : 0n;
+
         return {
-          solvent: balance >= this.config.minSponsorReserveStroops,
-          balanceStroops: balance,
+          solvent: available >= this.config.minSponsorReserveStroops,
+          balanceStroops: totalBalance,
+          availableStroops: available,
         };
       }
     } catch (e) {
-      // Fallback: If querying fails in test or mock environment, allow execution if minimum is 0
       console.warn("Could not query on-chain account entry, falling back:", e);
     }
 
     return {
       solvent: this.config.minSponsorReserveStroops === 0n,
       balanceStroops: 0n,
+      availableStroops: 0n,
     };
   }
 
@@ -86,7 +96,7 @@ export class KallpaKeeperDaemon {
 
     const solvency = await this.checkSponsorSolvency();
     if (!solvency.solvent) {
-      console.warn(`Sponsor reserve low (${solvency.balanceStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
+      console.warn(`Sponsor reserve low (${solvency.availableStroops} available stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
       return { processed: 0, errors: 0, skippedForLowFunds: true };
     }
 
@@ -138,14 +148,15 @@ export class KallpaKeeperDaemon {
 
   /**
    * Route 3: Disburse secondary recovery tranche.
-   * In Soroban ABI: Option<u32> where value is present is encoded directly as scvU32(val).
+   * Validates integer bounds strictly [1..50] and encodes directly as xdr.ScVal.scvU32.
    */
   async disburseSecondaryRecovery(
     poolContract: Contract,
     investor: string,
     maxTranches: number
   ): Promise<string> {
-    const boundedTranches = Math.max(1, Math.min(maxTranches, 50));
+    const rawVal = typeof maxTranches === "number" && Number.isInteger(maxTranches) ? maxTranches : 10;
+    const boundedTranches = Math.max(1, Math.min(rawVal, 50));
     const tranchesVal = xdr.ScVal.scvU32(boundedTranches);
     return this.executePermissionlessCall(poolContract, "claim_secondary_recovery", [
       new Address(investor).toScVal(),
@@ -162,7 +173,6 @@ export class KallpaKeeperDaemon {
     args: xdr.ScVal[]
   ): Promise<string> {
     const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
-
     const baseInclusionFee = 100000n; // 0.01 XLM base inclusion fee
 
     const tx = new TransactionBuilder(sponsorAccount, {
@@ -234,12 +244,17 @@ export class KallpaKeeperDaemon {
 
   /**
    * Poll RPC getTransaction with wall-clock deadline and strict SUCCESS verification.
+   * Post-verifies deadline upon receiving response to strictly reject late responses.
    */
   private async waitForConfirmation(txHash: string): Promise<void> {
     const deadline = Date.now() + 45000; // Strict 45s wall-clock deadline
 
     while (Date.now() < deadline) {
       const res = await this.server.getTransaction(txHash);
+      const now = Date.now();
+      if (now > deadline) {
+        throw new Error(`Transaction ${txHash} confirmation received past 45s deadline (took ${now - (deadline - 45000)}ms)`);
+      }
       if (res.status === "SUCCESS") {
         return;
       }
@@ -247,7 +262,7 @@ export class KallpaKeeperDaemon {
         throw new Error(`Transaction ${txHash} execution failed on-chain`);
       }
       // Check deadline before sleeping
-      if (Date.now() + 2000 > deadline) {
+      if (Date.now() + 2000 >= deadline) {
         break;
       }
       await new Promise((r) => setTimeout(r, 2000));
