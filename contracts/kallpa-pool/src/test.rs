@@ -385,3 +385,46 @@ fn test_admin_declare_settled_on_partial_repayment() {
 
     assert_eq!(p1 + p2, partial);
 }
+
+#[test]
+fn test_late_repayment_rejected_after_settled() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128; // 10,000 USDC
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 100_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &deadline,
+        &min_contribution,
+    );
+
+    // Investors fund target
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    // Payer repays target + yield in a single tranche (11,000 USDC) -> settles pool
+    setup.client.settle_repayment(&setup.payer, &11_000_0000000i128);
+
+    let (_, state, _, repaid) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Settled);
+    assert_eq!(repaid, 11_000_0000000i128);
+
+    // Investor 1 claims return
+    let p1 = setup.client.claim_return(&setup.investor1);
+    assert_eq!(p1, 6_600_0000000i128);
+
+    // Payer attempts a late repayment of 1,000 USDC after pool is Settled
+    // INVARIANT: Late repayment MUST be strictly rejected with PoolAlreadySettled to prevent R alteration mid-distribution
+    let res = setup.client.try_settle_repayment(&setup.payer, &1_000_0000000i128);
+    assert_eq!(res, Err(Ok(Error::PoolAlreadySettled)));
+
+    // Investor 2 claims return unaffected
+    let p2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(p2, 4_400_0000000i128);
+    assert_eq!(p1 + p2, 11_000_0000000i128);
+}

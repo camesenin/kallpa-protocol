@@ -182,8 +182,12 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        // Allow repayments in Funded or Settled state to support multi-tranche repayments
-        if state != PoolState::Funded && state != PoolState::Settled {
+        // Repayments are strictly allowed only in Funded state before the pool is frozen into Settled.
+        // Once Settled or Disputed, R becomes strictly immutable to protect pro-rata distribution integrity.
+        if state == PoolState::Settled {
+            return Err(Error::PoolAlreadySettled);
+        }
+        if state != PoolState::Funded {
             return Err(Error::PoolNotFunded);
         }
 

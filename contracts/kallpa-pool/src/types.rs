@@ -19,6 +19,7 @@ pub enum Error {
     MathOverflow = 13,
     MultipleDepositsNotAllowed = 14,
     PoolNotDisputed = 15,
+    PoolAlreadySettled = 16,
 }
 
 #[contracttype]
