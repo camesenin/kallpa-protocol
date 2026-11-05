@@ -33,9 +33,25 @@ impl KallpaPoolContract {
         if amount <= 0 {
             return Ok(());
         }
-        if amount < MIN_RECOVERY_TRANCHE {
-            return Err(Error::AmountBelowMinRecovery);
+
+        // Pull any existing pending buffer
+        let pending: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSecondaryBuffer)
+            .unwrap_or(0);
+
+        let combined = pending.checked_add(amount).ok_or(Error::MathOverflow)?;
+
+        if combined < MIN_RECOVERY_TRANCHE {
+            // Below threshold: accumulate in buffer without failing or reverting repayment
+            env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &combined);
+            return Ok(());
         }
+
+        // Once combined meets or exceeds MIN_RECOVERY_TRANCHE, materialize a discrete tranche
+        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+
         let count: u32 = env
             .storage()
             .instance()
@@ -44,7 +60,7 @@ impl KallpaPoolContract {
         let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
         env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
         let tranche_key = DataKey::SecondaryTranche(new_count);
-        env.storage().persistent().set(&tranche_key, &amount);
+        env.storage().persistent().set(&tranche_key, &combined);
         env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(())
     }

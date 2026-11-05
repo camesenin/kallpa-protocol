@@ -715,20 +715,27 @@ fn test_secondary_recovery_enforces_min_tranche_against_dust_fragmentation() {
 
     setup.client.settle_repayment(&setup.payer, &10_000_0000000i128);
 
-    // Attempting to post a micro-tranche of 1 stroop (0.0000001 USDC < MIN_RECOVERY_TRANCHE of 1.0 USDC)
-    // fails with AmountBelowMinRecovery
-    let res = setup.client.try_settle_repayment(&setup.payer, &1i128);
-    assert_eq!(res, Err(Ok(Error::AmountBelowMinRecovery)));
+    // Posting micro-amounts (e.g. 0.4 USDC = 4_000_000 stroops and 0.6 USDC = 6_000_000 stroops)
+    // does NOT revert the repayment! Instead, it safely accumulates in PendingSecondaryBuffer
+    let res1 = setup.client.try_settle_repayment(&setup.payer, &4_000_000i128);
+    assert!(res1.is_ok());
 
-    // Attempting to post 0.5 USDC (5_000_000 stroops < 10_000_000) also fails
-    let res_half = setup.client.try_settle_repayment(&setup.payer, &5_000_000i128);
-    assert_eq!(res_half, Err(Ok(Error::AmountBelowMinRecovery)));
+    // Still in buffer (< 10_000_000), no tranche materialized yet
+    let c1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    assert_eq!(c1, 0i128);
 
-    // Posting exactly MIN_RECOVERY_TRANCHE (10_000_000 stroops = 1.0 USDC) succeeds
-    let res_valid = setup.client.try_settle_repayment(&setup.payer, &10_000_000i128);
-    assert!(res_valid.is_ok());
+    // Second micro-amount arrives (6_000_000 stroops). Combined = 10_000_000 stroops = 1.0 USDC!
+    let res2 = setup.client.try_settle_repayment(&setup.payer, &6_000_000i128);
+    assert!(res2.is_ok());
+
+    // Materializes 1 tranche of 1.0 USDC (10_000_000 stroops)
+    // 60% of 10_000_000 = 6_000_000; 40% = 4_000_000
+    let c1_after = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    let c2_after = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(c1_after, 6_000_000i128);
+    assert_eq!(c2_after, 4_000_000i128);
+    assert_eq!(c1_after + c2_after, 10_000_000i128);
 }
-
 
 #[test]
 fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
@@ -736,7 +743,7 @@ fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
     // 1. Contributors pool funds into KallpaPool
     // 2. Pool releases funds to Trustless Work Escrow (address authenticated)
     // 3. Upstream dispute is resolved; Trustless Work invokes handle_dispute_refund directly
-    // 4. Returns exactly once without admin middleman or double-draw
+    // 4. Returns directly out of held funds without artificial re-minting
     // 5. Investors claim pro-rata shares with zero residual dust
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
@@ -761,15 +768,11 @@ fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
     setup.client.contribute(&setup.investor1, &7_000_0000000i128);
     setup.client.contribute(&setup.investor2, &3_000_0000000i128);
 
-    // Target reached -> Pool moves to Funded, releasing capital to Trustless Work Escrow
+    // Target reached -> Pool moves to Funded, releasing exactly 10,000 USDC to Trustless Work Escrow
     let (_, state, total_collected, _) = setup.client.get_pool_info();
     assert_eq!(state, PoolState::Funded);
     assert_eq!(total_collected, target);
     assert_eq!(setup.token_client.balance(&setup.tw_escrow), target);
-
-    // Mint tokens to TW escrow so it can return dispute funds directly
-    // (Simulating TW contract releasing held funds back to depositor upon Arbiter dispute ruling)
-    setup.token_admin.mint(&setup.tw_escrow, &8_000_0000000i128);
 
     // Scenario A: Unauthorized third party or rogue borrower attempts to call handle_dispute_refund
     let rogue = Address::generate(&setup.env);
@@ -777,9 +780,16 @@ fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
     assert_eq!(rogue_res, Err(Ok(Error::Unauthorized)));
 
     // Scenario B: TW Escrow directly invokes handle_dispute_refund with 8,000 USDC (80% recovery)
-    // No reliance on admin signature or approver benevolence
+    // CRITICAL: The funds transferred back COME DIRECTLY OUT OF THE 10,000 USDC HELD IN TW ESCROW!
+    // No artificial minting or external balance injections.
     let tw_res = setup.client.try_handle_dispute_refund(&setup.tw_escrow, &8_000_0000000i128);
     assert!(tw_res.is_ok());
+
+    // Verify TW Escrow balance after returning 8,000 USDC: exactly 2,000 USDC remains in escrow (e.g. fee/service provider share)
+    assert_eq!(setup.token_client.balance(&setup.tw_escrow), 2_000_0000000i128);
+
+    // Verify Kallpa Pool contract balance: exactly 8,000 USDC held for contributor claims
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 8_000_0000000i128);
 
     let (_, state_after, _, total_repaid) = setup.client.get_pool_info();
     assert_eq!(state_after, PoolState::Disputed);
@@ -791,4 +801,7 @@ fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
     assert_eq!(p1, 5_600_0000000i128);
     assert_eq!(p2, 2_400_0000000i128);
     assert_eq!(p1 + p2, 8_000_0000000i128);
+
+    // Verify Kallpa Pool contract balance after all claims: exactly 0 residual dust!
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }

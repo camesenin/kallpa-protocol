@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | **Stellar Testnet** | CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX | [Stellar.Expert](https://stellar.expert/explorer/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) · [Stellar Lab](https://lab.stellar.org/r/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) |
 | **Deployer** | GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E | [Stellar.Expert](https://stellar.expert/explorer/testnet/account/GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E) |
-| **WASM Hash** | c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de | Protocol 22 / Soroban v28 |
+| **WASM Hash** | efd397b1fe773b4af6a37dfbe6ddabdb4b80f861263b5c94ce2d5fb0d98c36bd (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 22 / Soroban v28 |
 
 ---
 

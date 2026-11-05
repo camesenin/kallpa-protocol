@@ -73,4 +73,5 @@ pub enum DataKey {
     InvestorList,
     SecondaryTrancheCount,
     SecondaryTranche(u32),
+    PendingSecondaryBuffer,
 }
