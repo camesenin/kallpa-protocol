@@ -1435,3 +1435,71 @@ fn test_zero_payout_advances_cursor_and_unlocks_future_positive_tranche() {
     let (_, claimed_final) = setup.client.get_secondary_claim_status(&setup.investor1);
     assert_eq!(claimed_final, 26);
 }
+
+#[test]
+fn test_metering_and_resource_limits_batches_1_25_50() {
+    let setup = setup_test();
+    let target = 1_000_000_000_0000000i128;
+    let repayment_target = 1_200_000_000_0000000i128;
+    let funding_deadline = 1000u64;
+    let repayment_deadline = 5000u64;
+    let min_contribution = 10_000_000i128; // 1 USDC
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.token_admin.mint(&setup.investor1, &10_000_000i128);
+    setup.client.contribute(&setup.investor1, &10_000_000i128);
+
+    let inv2_amt = target - 10_000_000i128;
+    setup.token_admin.mint(&setup.investor2, &inv2_amt);
+    setup.client.contribute(&setup.investor2, &inv2_amt);
+
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
+    setup.client.declare_default(&setup.investor1);
+
+    // Create 76 tranches: 1 tranche test (1), 25 tranches test (2..26), 50 tranches test (27..76)
+    for _ in 0..76 {
+        setup.token_admin.mint(&setup.payer, &10_000_000i128);
+        setup.client.settle_repayment(&setup.payer, &10_000_000i128);
+    }
+
+    // Benchmark Batch Size 1
+    setup.env.cost_estimate().budget().reset_default();
+    setup.client.claim_secondary_recovery(&setup.investor1, &Some(1));
+    let cpu_1 = setup.env.cost_estimate().budget().cpu_instruction_cost();
+    let mem_1 = setup.env.cost_estimate().budget().memory_bytes_cost();
+    // metric 1
+    assert!(cpu_1 < 25_000_000, "CPU for batch 1 must be well below Soroban 100M limit");
+    assert!(mem_1 < 10_000_000, "Mem for batch 1 must be well below Soroban 40MB limit");
+
+    // Benchmark Batch Size 25
+    setup.env.cost_estimate().budget().reset_default();
+    setup.client.claim_secondary_recovery(&setup.investor1, &Some(25));
+    let cpu_25 = setup.env.cost_estimate().budget().cpu_instruction_cost();
+    let mem_25 = setup.env.cost_estimate().budget().memory_bytes_cost();
+    // metric 25
+    assert!(cpu_25 < 40_000_000, "CPU for batch 25 must be well below Soroban 100M limit");
+    assert!(mem_25 < 15_000_000, "Mem for batch 25 must be well below Soroban 40MB limit");
+
+    // Benchmark Batch Size 50 (Protocol Cap)
+    setup.env.cost_estimate().budget().reset_default();
+    setup.client.claim_secondary_recovery(&setup.investor1, &Some(50));
+    let cpu_50 = setup.env.cost_estimate().budget().cpu_instruction_cost();
+    let mem_50 = setup.env.cost_estimate().budget().memory_bytes_cost();
+    // metric 50
+    assert!(cpu_50 < 80_000_000, "CPU for batch 50 must be well below Soroban 100M limit");
+    assert!(mem_50 < 30_000_000, "Mem for batch 50 must be well below Soroban 40MB limit");
+
+    let (_, claimed) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(claimed, 76);
+}

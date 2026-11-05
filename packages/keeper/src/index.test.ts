@@ -210,6 +210,8 @@ describe("@kallpa/keeper", () => {
       availableStroops: 80_000_000n,
     });
 
+    daemon.isSecondaryClaimExhausted = async () => false;
+
     (daemon as any).disburseSecondaryRecoveryWithReceipt = async (
       _contract: any,
       _investor: any,
@@ -217,7 +219,13 @@ describe("@kallpa/keeper", () => {
       _remaining: bigint
     ) => {
       // Confirmed on-chain advancement with 0 payout
-      return { txHash: "mockHashAdvancement", feeSpentStroops: 100_000n, payoutStroops: 0n };
+      return {
+        txHash: "mockHashAdvancement",
+        committedFeeStroops: 100_000n,
+        effectiveFeeStroops: 100_000n,
+        feeSpentStroops: 100_000n,
+        payoutStroops: 0n,
+      };
     };
 
     const targets = new Map([
@@ -235,5 +243,192 @@ describe("@kallpa/keeper", () => {
     expect(result.confirmedZeroPayoutAdvancements).toBe(2);
     expect(result.skippedExhausted).toBe(0);
     expect(result.totalFeeSpentStroops).toBe(200_000n);
+  });
+
+  it("preserves committed restoration fees across post-restoration failures and transport errors", async () => {
+    const tightConfig: KeeperConfig = {
+      ...dummyConfig,
+      maxSweepBudgetStroops: 300_000n,
+    };
+    const daemon = new KallpaKeeperDaemon(tightConfig);
+    const poolId = tightConfig.poolContractIds[0];
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    let restoreCallCount = 0;
+    (daemon as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => {
+        // Return restore preamble
+        return {
+          minResourceFee: "50000",
+          results: [{ auth: [], xdr: null }],
+          transactionData: new SorobanDataBuilder().build(),
+          restorePreamble: {
+            minResourceFee: "100000", // 100k restoration fee
+            transactionData: new SorobanDataBuilder().build(),
+          },
+        };
+      },
+      sendTransaction: async () => {
+        restoreCallCount++;
+        return { status: "SUCCESS", hash: "restoreHash123" };
+      },
+      getTransaction: async () => ({
+        status: "SUCCESS",
+        resultXdr: {
+          feeCharged: () => ({ toBigInt: () => 100000n, toString: () => "100000" }),
+        },
+      }),
+    };
+
+    // Override waitForConfirmation to simulate successful restore, but then make re-simulation fail!
+    let firstConfirmation = true;
+    (daemon as any).waitForConfirmation = async (hash: string) => {
+      if (firstConfirmation) {
+        firstConfirmation = false;
+        return { effectiveFeeCharged: 100000n };
+      }
+      return { effectiveFeeCharged: 50000n };
+    };
+
+    // Break server.simulateTransaction on second call (post-restoration re-simulation)
+    let simCount = 0;
+    const origSim = (daemon as any).server.simulateTransaction;
+    (daemon as any).server.simulateTransaction = async (tx: any) => {
+      simCount++;
+      if (simCount === 2) {
+        return { error: "Simulated RPC failure during re-simulation after restoration" };
+      }
+      return origSim(tx);
+    };
+
+    const realContract = new Contract(poolId);
+    let capturedErr: any = null;
+    try {
+      await (daemon as any).executePermissionlessCall(
+        realContract,
+        "claim_return",
+        [new Address(Keypair.random().publicKey()).toScVal()],
+        250000n
+      );
+    } catch (err: any) {
+      capturedErr = err;
+    }
+
+    expect(capturedErr).toBeDefined();
+    // CRITICAL: The committedFeeStroops must NOT be lost!
+    expect(capturedErr.committedFeeStroops).toBe(200000n); // 100k base + 100k resource
+    expect(capturedErr.effectiveFeeStroops).toBe(100000n);
+  });
+
+  it("evaluates next claim after reaching maxZeroPayouts and processes positive payout without blocking", async () => {
+    const daemon = new KallpaKeeperDaemon({
+      ...dummyConfig,
+      maxZeroPayoutTranchesPerCycle: 1, // Only 1 zero payout allowed
+    });
+    const poolId = dummyConfig.poolContractIds[0];
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    daemon.isSecondaryClaimExhausted = async () => false;
+
+    const investor1 = Keypair.random().publicKey();
+    const investor2 = Keypair.random().publicKey();
+
+    // Investor 1 is simulated with 0 payout; Investor 2 is simulated with positive 5000 payout
+    (daemon as any).isClaimZeroPayout = async (_contract: any, _method: string, args: any[]) => {
+      // If investor is investor1, returns true (zero payout). If investor2, returns false (positive payout!)
+      const invAddr = Address.fromScVal(args[0]).toString();
+      return invAddr === investor1;
+    };
+
+    let processedInvestors: string[] = [];
+    (daemon as any).disburseSecondaryRecoveryWithReceipt = async (
+      _contract: any,
+      investor: string,
+      _tranches: number,
+      _remaining: bigint
+    ) => {
+      processedInvestors.push(investor);
+      const payout = investor === investor1 ? 0n : 5000n;
+      return {
+        txHash: "mockHash_" + investor,
+        committedFeeStroops: 100000n,
+        effectiveFeeStroops: 80000n,
+        feeSpentStroops: 80000n,
+        payoutStroops: payout,
+      };
+    };
+
+    const targets = new Map([
+      [
+        poolId,
+        [
+          { investor: investor1, action: "claim_secondary" as const }, // zero payout -> reaches maxZeroPayouts limit of 1
+          { investor: investor1, action: "claim_secondary" as const }, // zero payout -> MUST be skipped
+          { investor: investor2, action: "claim_secondary" as const }, // positive payout -> MUST NOT be blocked!
+        ],
+      ],
+    ]);
+
+    const result = await daemon.runSweepCycle(targets);
+    // investor1 executed once (count = 1), second investor1 skipped, investor2 executed (positive payout!)
+    expect(processedInvestors).toContain(investor1);
+    expect(processedInvestors).toContain(investor2);
+    expect(result.processed).toBe(2);
+    expect(result.confirmedZeroPayoutAdvancements).toBe(1);
+  });
+
+  it("contrasts simulated fee reservation against exact on-chain fee charged from confirmed execution", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const poolId = dummyConfig.poolContractIds[0];
+
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    (daemon as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => ({
+        minResourceFee: "100000",
+        results: [{ auth: [], xdr: null, retval: xdr.ScVal.scvI128(new xdr.Int128Parts({ lo: xdr.Uint64.fromString("100"), hi: xdr.Int64.fromString("0") })) }],
+        transactionData: new SorobanDataBuilder().setResourceFee(100000).build(),
+      }),
+      sendTransaction: async () => ({ status: "SUCCESS", hash: "testExactFeeHash" }),
+      getTransaction: async () => ({
+        status: "SUCCESS",
+        resultXdr: {
+          feeCharged: () => ({ toBigInt: () => 123456n, toString: () => "123456" }),
+        },
+        returnValue: xdr.ScVal.scvI128(new xdr.Int128Parts({ lo: xdr.Uint64.fromString("5000"), hi: xdr.Int64.fromString("0") })),
+      }),
+    };
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    const realContract = new Contract(poolId);
+    const receipt = await daemon.disburseClaimReturnWithReceipt(realContract, Keypair.random().publicKey(), 1000000n);
+
+    // Max committed envelope fee reserved was 200,000 stroops
+    expect(receipt.committedFeeStroops).toBe(200000n);
+    // Exact fee charged confirmed on-chain was 123,456 stroops
+    expect(receipt.effectiveFeeStroops).toBe(123456n);
+    // Confirmed on-chain payout was 5,000 stroops (reconciled over simulation)
+    expect(receipt.payoutStroops).toBe(5000n);
   });
 });
