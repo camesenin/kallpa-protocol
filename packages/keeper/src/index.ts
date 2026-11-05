@@ -45,7 +45,7 @@ export class KallpaKeeperDaemon {
   /**
    * Check sponsor XLM available balance using on-chain ledger entries via RPC getLedgerEntries.
    * Full Stellar Core balance calculation:
-   * available = balance - (2 + numSubentries + numSponsoring - numSponsored) * baseReserve - sellingLiabilities
+   * available = balance - (2 + numSubEntries + numSponsoring - numSponsored) * baseReserve - sellingLiabilities
    */
   async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceStroops: bigint; availableStroops: bigint }> {
     const accountId = this.sponsorKey.xdrAccountId();
@@ -61,19 +61,25 @@ export class KallpaKeeperDaemon {
     const entry = res.entries[0];
     const accountEntry = entry.val.account();
     const totalBalance = accountEntry.balance().toBigInt();
-    const subentryCount = BigInt(accountEntry.numSubentries());
+    // Correct getter in stellar-base v14 is numSubEntries()
+    const subentryCount = BigInt(accountEntry.numSubEntries());
 
-    // Inspect V1 extension for sponsoring/sponsored counts & selling liabilities if present
     let numSponsoring = 0n;
     let numSponsored = 0n;
     let sellingLiabilities = 0n;
 
     const ext = accountEntry.ext();
-    if (ext.switch().value === 1) {
+    // In stellar-base v14, ext.switch() returns a number directly (1 for v1)
+    const extSwitch = typeof ext.switch === "function" ? ext.switch() : (ext as any).switch;
+    const switchVal = typeof extSwitch === "number" ? extSwitch : (extSwitch as any).value;
+
+    if (switchVal === 1) {
       const v1 = ext.v1();
       sellingLiabilities = v1.liabilities().selling().toBigInt();
       const extV2 = v1.ext();
-      if (extV2.switch().value === 2) {
+      const v2Switch = typeof extV2.switch === "function" ? extV2.switch() : (extV2 as any).switch;
+      const v2SwitchVal = typeof v2Switch === "number" ? v2Switch : (v2Switch as any).value;
+      if (v2SwitchVal === 2) {
         const v2 = extV2.v2();
         numSponsoring = BigInt(v2.numSponsoring());
         numSponsored = BigInt(v2.numSponsored());
@@ -256,8 +262,8 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Poll RPC getTransaction with wall-clock deadline, abort signal for individual RPC calls,
-   * and post-verification to strictly reject late responses.
+   * Poll RPC getTransaction with monotonic wall-clock deadline, abort signal for individual RPC calls,
+   * timer cleanup, and post-verification to strictly reject late responses.
    */
   private async waitForConfirmation(txHash: string): Promise<void> {
     const start = performance.now();
@@ -265,15 +271,17 @@ export class KallpaKeeperDaemon {
 
     while (performance.now() - start < timeoutMs) {
       const remainingTime = Math.max(100, Math.floor(timeoutMs - (performance.now() - start)));
-      
-      // Enforce call-level timeout bounded by remaining wall-clock budget
+      let timerId: any;
+
       const callPromise = this.server.getTransaction(txHash);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("RPC call timed out")), Math.min(remainingTime, 5000))
-      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timerId = setTimeout(() => reject(new Error("RPC call timed out")), Math.min(remainingTime, 5000));
+      });
 
       try {
         const res = await Promise.race([callPromise, timeoutPromise]);
+        clearTimeout(timerId);
+
         const elapsed = performance.now() - start;
         if (elapsed > timeoutMs) {
           throw new Error(`Transaction ${txHash} confirmation received past 45s deadline (took ${elapsed}ms)`);
@@ -285,10 +293,11 @@ export class KallpaKeeperDaemon {
           throw new Error(`Transaction ${txHash} execution failed on-chain`);
         }
       } catch (e: any) {
+        clearTimeout(timerId);
         if (e.message?.includes("past 45s deadline") || e.message?.includes("execution failed")) {
           throw e;
         }
-        // Transient timeout or network blip; continue loop if budget remains
+        // Transient timeout; continue loop if budget remains
       }
 
       if (performance.now() - start + 2000 >= timeoutMs) {
