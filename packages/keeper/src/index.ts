@@ -2,8 +2,8 @@
  * Kallpa Protocol - Autonomous Keeper Service Daemon
  *
  * Implements full coverage of claim_return, refund, and claim_secondary_recovery,
- * real position processing, sponsor balance tracking, Protocol 23 restoration fallback,
- * and robust confirmation handling.
+ * real position processing, per-transaction sponsor balance preservation,
+ * Protocol 23 restoration fallback, and robust confirmation handling.
  */
 
 import {
@@ -61,7 +61,6 @@ export class KallpaKeeperDaemon {
     const entry = res.entries[0];
     const accountEntry = entry.val.account();
     const totalBalance = accountEntry.balance().toBigInt();
-    // Correct getter in stellar-base v14 is numSubEntries()
     const subentryCount = BigInt(accountEntry.numSubEntries());
 
     let numSponsoring = 0n;
@@ -69,7 +68,6 @@ export class KallpaKeeperDaemon {
     let sellingLiabilities = 0n;
 
     const ext = accountEntry.ext();
-    // In stellar-base v14, ext.switch() returns a number directly (1 for v1)
     const extSwitch = typeof ext.switch === "function" ? ext.switch() : (ext as any).switch;
     const switchVal = typeof extSwitch === "number" ? extSwitch : (extSwitch as any).value;
 
@@ -102,7 +100,7 @@ export class KallpaKeeperDaemon {
 
   /**
    * Monitor registered pools and disburse pending claims permissionlessly
-   * across all three protocol claiming routes.
+   * across all three protocol claiming routes with continuous per-transaction budget protection.
    */
   async runSweepCycle(
     targetsByPool: Map<string, InvestorClaimTarget[]>
@@ -110,17 +108,18 @@ export class KallpaKeeperDaemon {
     let processed = 0;
     let errors = 0;
 
-    const solvency = await this.checkSponsorSolvency();
-    if (!solvency.solvent) {
-      console.warn(`Sponsor reserve low (${solvency.availableStroops} available stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
-      return { processed: 0, errors: 0, skippedForLowFunds: true };
-    }
-
     for (const poolId of this.config.poolContractIds) {
       const targets = targetsByPool.get(poolId) || [];
       const poolContract = new Contract(poolId);
 
       for (const target of targets) {
+        // Continuous per-transaction budget check: verify solvency before each operation
+        const solvency = await this.checkSponsorSolvency();
+        if (!solvency.solvent) {
+          console.warn(`Sponsor reserve low (${solvency.availableStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
+          return { processed, errors, skippedForLowFunds: true };
+        }
+
         try {
           if (target.action === "claim_return") {
             await this.disburseClaimReturn(poolContract, target.investor);
@@ -216,6 +215,12 @@ export class KallpaKeeperDaemon {
       // Total fee = Base Inclusion Fee + Resource Restoration Fee
       const totalRestoreFee = baseInclusionFee + BigInt(simRes.restorePreamble.minResourceFee);
 
+      // Verify that available balance covers restoration fee while maintaining minimum reserve
+      const preRestoreSolvency = await this.checkSponsorSolvency();
+      if (preRestoreSolvency.availableStroops < totalRestoreFee + this.config.minSponsorReserveStroops) {
+        throw new Error(`Insufficient sponsor balance for restoration: available ${preRestoreSolvency.availableStroops} < required ${totalRestoreFee + this.config.minSponsorReserveStroops}`);
+      }
+
       const restoreTxBuilder = new TransactionBuilder(restoreAccount, {
         fee: totalRestoreFee.toString(),
         networkPassphrase: this.config.networkPassphrase,
@@ -249,7 +254,12 @@ export class KallpaKeeperDaemon {
       preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 
-    // 3. Sign with sponsor key and submit
+    // 3. Verify balance covers final invocation fee before signing
+    const preSendSolvency = await this.checkSponsorSolvency();
+    if (preSendSolvency.availableStroops < baseInclusionFee + this.config.minSponsorReserveStroops) {
+      throw new Error(`Insufficient sponsor balance for invocation: available ${preSendSolvency.availableStroops} < required ${baseInclusionFee + this.config.minSponsorReserveStroops}`);
+    }
+
     preparedTx.sign(this.sponsorKey);
     const sendRes = await this.server.sendTransaction(preparedTx);
 
