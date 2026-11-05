@@ -44,43 +44,53 @@ export class KallpaKeeperDaemon {
 
   /**
    * Check sponsor XLM available balance using on-chain ledger entries via RPC getLedgerEntries.
-   * Passes accountKey as a direct parameter (rest parameter syntax in SDK v14) and accesses entry.val.
-   * Calculates available balance by subtracting minimum reserve from total balance.
+   * Full Stellar Core balance calculation:
+   * available = balance - (2 + numSubentries + numSponsoring - numSponsored) * baseReserve - sellingLiabilities
    */
   async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceStroops: bigint; availableStroops: bigint }> {
-    try {
-      const accountId = this.sponsorKey.xdrAccountId();
-      const accountKey = xdr.LedgerKey.account(
-        new xdr.LedgerKeyAccount({ accountId })
-      );
+    const accountId = this.sponsorKey.xdrAccountId();
+    const accountKey = xdr.LedgerKey.account(
+      new xdr.LedgerKeyAccount({ accountId })
+    );
 
-      // In SDK v14 getLedgerEntries accepts keys as separate arguments (...keys)
-      const res = await this.server.getLedgerEntries(accountKey);
-      if (res.entries && res.entries.length > 0) {
-        const entry = res.entries[0];
-        // entry.val contains the parsed xdr.LedgerEntryData
-        const accountEntry = entry.val.account();
-        const totalBalance = accountEntry.balance().toBigInt();
-        const subentryCount = BigInt(accountEntry.numSubentries());
-        // Standard Stellar reserve math: base reserve = 0.5 XLM (5_000_000 stroops)
-        // Min reserve = (2 + numSubentries) * baseReserve
-        const minReserve = (2n + subentryCount) * 5_000_000n;
-        const available = totalBalance > minReserve ? totalBalance - minReserve : 0n;
-
-        return {
-          solvent: available >= this.config.minSponsorReserveStroops,
-          balanceStroops: totalBalance,
-          availableStroops: available,
-        };
-      }
-    } catch (e) {
-      console.warn("Could not query on-chain account entry, falling back:", e);
+    const res = await this.server.getLedgerEntries(accountKey);
+    if (!res.entries || res.entries.length === 0) {
+      throw new Error("Sponsor account entry not found on-chain");
     }
 
+    const entry = res.entries[0];
+    const accountEntry = entry.val.account();
+    const totalBalance = accountEntry.balance().toBigInt();
+    const subentryCount = BigInt(accountEntry.numSubentries());
+
+    // Inspect V1 extension for sponsoring/sponsored counts & selling liabilities if present
+    let numSponsoring = 0n;
+    let numSponsored = 0n;
+    let sellingLiabilities = 0n;
+
+    const ext = accountEntry.ext();
+    if (ext.switch().value === 1) {
+      const v1 = ext.v1();
+      sellingLiabilities = v1.liabilities().selling().toBigInt();
+      const extV2 = v1.ext();
+      if (extV2.switch().value === 2) {
+        const v2 = extV2.v2();
+        numSponsoring = BigInt(v2.numSponsoring());
+        numSponsored = BigInt(v2.numSponsored());
+      }
+    }
+
+    const baseReserve = 5_000_000n; // 0.5 XLM in stroops
+    const effectiveSubentries = 2n + subentryCount + numSponsoring - numSponsored;
+    const minReserve = effectiveSubentries * baseReserve;
+    const reservedTotal = minReserve + sellingLiabilities;
+
+    const available = totalBalance > reservedTotal ? totalBalance - reservedTotal : 0n;
+
     return {
-      solvent: this.config.minSponsorReserveStroops === 0n,
-      balanceStroops: 0n,
-      availableStroops: 0n,
+      solvent: available >= this.config.minSponsorReserveStroops,
+      balanceStroops: totalBalance,
+      availableStroops: available,
     };
   }
 
@@ -111,10 +121,11 @@ export class KallpaKeeperDaemon {
           } else if (target.action === "refund") {
             await this.disburseRefund(poolContract, target.investor);
           } else if (target.action === "claim_secondary") {
+            const tranches = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
             await this.disburseSecondaryRecovery(
               poolContract,
               target.investor,
-              target.maxTranches || this.config.maxTranchesPerBatch
+              tranches
             );
           }
           processed++;
@@ -148,16 +159,18 @@ export class KallpaKeeperDaemon {
 
   /**
    * Route 3: Disburse secondary recovery tranche.
-   * Validates integer bounds strictly [1..50] and encodes directly as xdr.ScVal.scvU32.
+   * Strictly validates integer in range [1..50]. Rejects invalid input without coercion.
    */
   async disburseSecondaryRecovery(
     poolContract: Contract,
     investor: string,
     maxTranches: number
   ): Promise<string> {
-    const rawVal = typeof maxTranches === "number" && Number.isInteger(maxTranches) ? maxTranches : 10;
-    const boundedTranches = Math.max(1, Math.min(rawVal, 50));
-    const tranchesVal = xdr.ScVal.scvU32(boundedTranches);
+    if (typeof maxTranches !== "number" || !Number.isInteger(maxTranches) || maxTranches < 1 || maxTranches > 50) {
+      throw new Error(`Invalid maxTranches: ${maxTranches}. Must be an integer between 1 and 50.`);
+    }
+
+    const tranchesVal = xdr.ScVal.scvU32(maxTranches);
     return this.executePermissionlessCall(poolContract, "claim_secondary_recovery", [
       new Address(investor).toScVal(),
       tranchesVal,
@@ -243,30 +256,47 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Poll RPC getTransaction with wall-clock deadline and strict SUCCESS verification.
-   * Post-verifies deadline upon receiving response to strictly reject late responses.
+   * Poll RPC getTransaction with wall-clock deadline, abort signal for individual RPC calls,
+   * and post-verification to strictly reject late responses.
    */
   private async waitForConfirmation(txHash: string): Promise<void> {
-    const deadline = Date.now() + 45000; // Strict 45s wall-clock deadline
+    const start = performance.now();
+    const timeoutMs = 45000; // Strict 45s monotonic deadline
 
-    while (Date.now() < deadline) {
-      const res = await this.server.getTransaction(txHash);
-      const now = Date.now();
-      if (now > deadline) {
-        throw new Error(`Transaction ${txHash} confirmation received past 45s deadline (took ${now - (deadline - 45000)}ms)`);
+    while (performance.now() - start < timeoutMs) {
+      const remainingTime = Math.max(100, Math.floor(timeoutMs - (performance.now() - start)));
+      
+      // Enforce call-level timeout bounded by remaining wall-clock budget
+      const callPromise = this.server.getTransaction(txHash);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("RPC call timed out")), Math.min(remainingTime, 5000))
+      );
+
+      try {
+        const res = await Promise.race([callPromise, timeoutPromise]);
+        const elapsed = performance.now() - start;
+        if (elapsed > timeoutMs) {
+          throw new Error(`Transaction ${txHash} confirmation received past 45s deadline (took ${elapsed}ms)`);
+        }
+        if (res.status === "SUCCESS") {
+          return;
+        }
+        if (res.status === "FAILED") {
+          throw new Error(`Transaction ${txHash} execution failed on-chain`);
+        }
+      } catch (e: any) {
+        if (e.message?.includes("past 45s deadline") || e.message?.includes("execution failed")) {
+          throw e;
+        }
+        // Transient timeout or network blip; continue loop if budget remains
       }
-      if (res.status === "SUCCESS") {
-        return;
-      }
-      if (res.status === "FAILED") {
-        throw new Error(`Transaction ${txHash} execution failed on-chain`);
-      }
-      // Check deadline before sleeping
-      if (Date.now() + 2000 >= deadline) {
+
+      if (performance.now() - start + 2000 >= timeoutMs) {
         break;
       }
       await new Promise((r) => setTimeout(r, 2000));
     }
-    throw new Error(`Transaction ${txHash} confirmation timed out after 45s deadline`);
+
+    throw new Error(`Transaction ${txHash} confirmation timed out after 45s monotonic deadline`);
   }
 }
