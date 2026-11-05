@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | **Stellar Testnet** | CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX | [Stellar.Expert](https://stellar.expert/explorer/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) · [Stellar Lab](https://lab.stellar.org/r/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) |
 | **Deployer** | GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E | [Stellar.Expert](https://stellar.expert/explorer/testnet/account/GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E) |
-| **WASM Hash** | bdd0f00eae5336a3c8f728dfa19a3e0e2c87a9f66178c9929b83dace647acd9a (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 23 / Soroban v28 |
+| **WASM Hash** | 6b78f7c7ca6840b68ec55624a62c7b01370323f03971a1d96a74000f83dcfd9e (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 23 / Soroban v28 |
 
 ---
 
@@ -51,7 +51,7 @@ flowchart TD
         KP1 -->|"Target Reached (Atomic)"| TW1["Trustless Work Escrow (Depositor: Kallpa)"]
         TW1 -->|"Milestone Approved"| DEV["Developer / Auditor (Beneficiary)"]
         TW1 -.->|"Dispute Resolved (SEP-41 Return)"| KP1
-        KP1 -.->|"Refund on Dispute (sync_dispute_refund) / Expiry"| A1
+        KP1 -.->|"Refund on Dispute (reconcile_incoming_balance) / Expiry"| A1
     end
 
     subgraph Mode B: Syndicated Liquidity Advance
@@ -126,7 +126,7 @@ SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2=1 cargo build --target wasm32v
 ```bash
 cargo test --workspace
 ```
-*Current test suite: 10 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, and post-default secondary recovery flow with multiple recovery tranches).*
+*Current test suite: 15 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, late repayment routing to secondary recovery buffer post-settlement, multi-tranche repayment reaching repayment_target with yield, and post-default secondary recovery flow with multiple recovery tranches).*
 
 ### 3. Run TypeScript SDK Tests
 ```bash
@@ -144,7 +144,7 @@ All development milestones adhere to the **Stellar Community Fund (SCF) Build Aw
 | Tranche | % Award | Value (USD) | Verifiable Scope & Deliverables |
 | :--- | :---: | :---: | :--- |
 | **Tranche #0 (Kickoff)** | 10% | **$1,500** | Completion of onboarding, legal compliance, formal architecture freeze, and technical review session with Trustless Work ecosystem contributors. |
-| **Tranche #1 (MVP Core)** | 20% | **$3,000** | Hardened Soroban smart contract in Rust deployed on Testnet. Implementation of the **Pull-Payment claim pattern**, single collapsed deposit positions per user, formal `proptest` property-based fuzzing suite proving the zero-dust invariant across $10^6$ randomized distributions, and automated GitHub Actions CI. |
+| **Tranche #1 (MVP Core)** | 20% | **$3,000** | Hardened Soroban smart contract in Rust deployed on Testnet. Implementation of the **Pull-Payment claim pattern**, single deposit position per user (telescoping intervals), formal `proptest` property-based fuzzing suite proving the zero-dust invariant across $10^6$ randomized distributions, and automated GitHub Actions CI. |
 | **Tranche #2 (Testnet & TW Integration / Upstream Reallocation)** | 30% | **$4,500** | Delivery of the kallpa-adapter-tw integration crate resolving Runtime Verification finding B08. Automated end-to-end Testnet testing suite simulating full lifecycle: Multi-party pooling → Trustless Work Escrow funding → Milestone release / Dispute trigger → Permissionless pro-rata refund. <br><br>*(Upstream Reallocation Clause: If Trustless Work releases native multi-depositor dispute resolution before or during this milestone—objectively verified by onchain multi-depositor refund events on Testnet or official TW contract v2 release tag—the $4,500 budget and scope automatically reallocate to kallpa-adapter-general. Concrete deliverable benchmarks for kallpa-adapter-general include: (1) SyndicatedVaultContract with multisig quorum deposits and automated LP pooling into Soroswap router; (2) SDK integration suite @kallpa/adapter-general with 100% test coverage; (3) Onchain Testnet deployment verification script. This eliminates third-party dependency while guaranteeing verifiable delivery of syndicated credit primitives).* |
 | **Tranche #3 (Mainnet Launch & UX)** | 40% | **$6,000** | Production Mainnet deployment with registered **Onchain Footprint** (Contract IDs, telemetry, and CAP-33 sponsorship configuration). Publication of `@kallpa/sdk` on NPM, responsive reference dApp with Freighter Wallet integration, bilingual documentation, and application to the **Stellar Audit Bank** for external security review. |
 

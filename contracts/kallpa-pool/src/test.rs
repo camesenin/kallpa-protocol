@@ -860,3 +860,60 @@ fn test_flush_secondary_buffer_prevents_fund_lockup() {
     // Exactly zero residual funds locked in the contract!
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
+
+
+#[test]
+fn test_autonomous_balance_reconciliation_on_direct_tw_refund() {
+    // Verifies autonomous reconciliation when Trustless Work or arbiter sends funds
+    // DIRECTLY to the pool contract address (push transfer), bypassing caller withdrawal:
+    // 1. Contributors pool 10,000 USDC -> Released to TW Escrow
+    // 2. Dispute occurs; TW Escrow contract executes a native token transfer of 8,000 USDC directly to KallpaPool address
+    // 3. Anyone (e.g. contributor, keeper) invokes `reconcile_incoming_balance` permissionlessly
+    // 4. Contract recognizes unrecorded surplus, updates TotalRepaid to 8,000 USDC, and transitions to Disputed
+    // 5. Investors claim exact pro-rata returns with zero residual dust
+    let setup = setup_test();
+    let target = 10_000_0000000i128; // 10,000 USDC
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128); // 60%
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128); // 40%
+
+    // Target funded -> 10,000 USDC sits in tw_escrow
+    assert_eq!(setup.token_client.balance(&setup.tw_escrow), target);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+
+    // TW Escrow executes a DIRECT token transfer to KallpaPool address (no caller withdraw required)
+    setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &7_500_0000000i128);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 7_500_0000000i128);
+
+    // Any contributor or keeper calls reconcile_incoming_balance permissionlessly
+    let surplus = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(surplus, 7_500_0000000i128);
+
+    let (_, state, _, total_repaid) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Disputed);
+    assert_eq!(total_repaid, 7_500_0000000i128);
+
+    // Investors claim pro-rata: 60% of 7,500 = 4,500 USDC; 40% of 7,500 = 3,000 USDC
+    let p1 = setup.client.claim_return(&setup.investor1);
+    let p2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(p1, 4_500_0000000i128);
+    assert_eq!(p2, 3_000_0000000i128);
+    assert_eq!(p1 + p2, 7_500_0000000i128);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+}

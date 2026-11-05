@@ -24,6 +24,9 @@ const MIN_RECOVERY_TRANCHE: i128 = 10_000_000i128; // 1.0 USDC (7 decimals)
 // Maximum tranches processed per paginated batch claim
 const MAX_BATCH_CLAIM_TRANCHES: u32 = 50;
 
+// Minimum cooldown period (in seconds) between manual flush calls to prevent spamming micro-tranches
+const FLUSH_COOLDOWN_SECONDS: u64 = 86400; // 24 hours
+
 #[contract]
 pub struct KallpaPoolContract;
 
@@ -685,7 +688,21 @@ impl KallpaPoolContract {
             return Ok(0);
         }
 
+        // Anti-spam cooldown: enforce FLUSH_COOLDOWN_SECONDS between successive flushes
+        let now = env.ledger().timestamp();
+        let last_flush_opt: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastFlushTimestamp);
+
+        if let Some(last_flush) = last_flush_opt {
+            if now < last_flush.saturating_add(FLUSH_COOLDOWN_SECONDS) {
+                return Err(Error::DeadlinePassed);
+            }
+        }
+
         env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+        env.storage().instance().set(&DataKey::LastFlushTimestamp, &now);
 
         let count: u32 = env
             .storage()
@@ -700,6 +717,80 @@ impl KallpaPoolContract {
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         Ok(pending)
+    }
+
+    /// Autonomous onchain reconciliation of funds returned directly by Trustless Work or external escrow.
+    /// Eliminates reliance on active admin approval or second token transfers:
+    /// Any participant can call this function to inspect the contract's actual token balance,
+    /// compute any unrecorded surplus above RecognizedBalance, and cleanly record it
+    /// into primary TotalRepaid (transitioning Funded -> Disputed) or into discrete secondary tranches.
+    pub fn reconcile_incoming_balance(env: Env, caller: Address) -> Result<i128, Error> {
+        caller.require_auth();
+
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
+            return Err(Error::PoolNotFunded);
+        }
+
+        let token_client = token::Client::new(&env, &config.asset);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+
+        let recognized: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecognizedBalance)
+            .unwrap_or(0);
+
+        let surplus = actual_balance.checked_sub(recognized).ok_or(Error::MathOverflow)?;
+        if surplus <= 0 {
+            return Ok(0);
+        }
+
+        // Update recognized balance to match actual onchain balance
+        env.storage().instance().set(&DataKey::RecognizedBalance, &actual_balance);
+
+        if state == PoolState::Funded {
+            let total_repaid: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalRepaid)
+                .unwrap_or(0);
+
+            let remaining_obligation = config
+                .repayment_target
+                .checked_sub(total_repaid)
+                .ok_or(Error::MathOverflow)?;
+
+            let (primary_part, secondary_part) = if surplus > remaining_obligation {
+                (remaining_obligation, surplus.checked_sub(remaining_obligation).ok_or(Error::MathOverflow)?)
+            } else {
+                (surplus, 0i128)
+            };
+
+            let new_repaid = total_repaid.checked_add(primary_part).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
+            env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
+
+            if secondary_part > 0 {
+                Self::record_secondary_tranche(&env, secondary_part)?;
+            }
+        } else {
+            Self::record_secondary_tranche(&env, surplus)?;
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(surplus)
     }
 
 pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Error> {

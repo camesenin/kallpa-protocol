@@ -74,4 +74,6 @@ pub enum DataKey {
     SecondaryTrancheCount,
     SecondaryTranche(u32),
     PendingSecondaryBuffer,
+    LastFlushTimestamp,
+    RecognizedBalance,
 }

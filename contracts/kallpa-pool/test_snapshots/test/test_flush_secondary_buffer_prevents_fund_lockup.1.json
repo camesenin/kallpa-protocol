@@ -954,6 +954,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "LastFlushTimestamp"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u64": "0"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "PendingSecondaryBuffer"
                           }
                         ]
