@@ -937,4 +937,23 @@ pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Er
     pub fn get_position(env: Env, investor: Address) -> Option<Position> {
         env.storage().persistent().get(&DataKey::Position(investor))
     }
+
+    /// Read secondary recovery tranche status.
+    /// Returns (total_secondary_tranches, investor_claimed_tranches).
+    pub fn get_secondary_claim_status(env: Env, investor: Address) -> (u32, u32) {
+        let total_tranches: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecondaryTrancheCount)
+            .unwrap_or(0);
+
+        let claimed_tranches = env
+            .storage()
+            .persistent()
+            .get::<_, Position>(&DataKey::Position(investor))
+            .map(|p| p.claimed_tranches)
+            .unwrap_or(0);
+
+        (total_tranches, claimed_tranches)
+    }
 }

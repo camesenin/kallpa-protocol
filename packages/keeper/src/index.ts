@@ -196,6 +196,42 @@ export class KallpaKeeperDaemon {
    * with zero new recovery to distribute), the function short-circuits and returns null without submitting,
    * completely preventing gas/sponsor exhaustion on exhausted claims.
    */
+  /**
+   * Checks whether an investor has already claimed all available secondary recovery tranches.
+   * If total_tranches <= claimed_tranches, further calls are redundant (returning 0 with no cursor advancement),
+   * allowing the Keeper to safely short-circuit without wasting sponsor XLM.
+   * Conversely, if total_tranches > claimed_tranches, calls MUST proceed to advance the on-chain cursor
+   * even if individual micro-tranches round down to zero!
+   */
+  async isSecondaryClaimExhausted(poolContract: Contract, investorVal: xdr.ScVal): Promise<boolean> {
+    try {
+      const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
+      const tx = new TransactionBuilder(sponsorAccount, {
+        fee: "100000",
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(poolContract.call("get_secondary_claim_status", investorVal))
+        .setTimeout(30)
+        .build();
+
+      const simRes = await this.server.simulateTransaction(tx);
+      if (!rpc.Api.isSimulationError(simRes) && simRes.result && simRes.result.retval) {
+        const val = simRes.result.retval;
+        if (val.switch().value === xdr.ScValType.scvVec().value) {
+          const vec = val.vec();
+          if (vec && vec.length >= 2) {
+            const total = vec[0].u32();
+            const claimed = vec[1].u32();
+            return total <= claimed;
+          }
+        }
+      }
+    } catch (e) {
+      // Fallback: do not short-circuit on inspection error
+    }
+    return false;
+  }
+
   private async executePermissionlessCall(
     poolContract: Contract,
     method: string,
@@ -218,24 +254,16 @@ export class KallpaKeeperDaemon {
       throw new Error(`Simulation failed: ${simRes.error}`);
     }
 
-    // Inspect simulation result: if payout is 0, do NOT waste sponsor gas!
-    if (simRes.result && simRes.result.retval) {
-      try {
-        const val = simRes.result.retval;
-        // In Soroban ABI: i128 (payout) is encoded as ScVal.scvI128
-        if (val.switch().value === xdr.ScValType.scvI128().value) {
-          const lo = val.i128().lo().toBigInt();
-          const hi = val.i128().hi().toBigInt();
-          if (lo === 0n && hi === 0n) {
-            // Simulated payout is exactly 0: short-circuit to preserve sponsor budget!
-            return null;
-          }
-        }
-      } catch (e) {
-        // Fallback: proceed if return value parsing fails
+    // Critical Progress Guard:
+    // If calling claim_secondary_recovery, only short-circuit if the investor is ALREADY fully claimed
+    // (total_tranches <= claimed_tranches). If unvisited tranches exist, the transaction MUST be submitted
+    // on-chain to advance position.claimed_tranches cursor, preventing infinite stalling on zero-payout micro-tranches!
+    if (method === "claim_secondary_recovery" && args.length > 0) {
+      const isExhausted = await this.isSecondaryClaimExhausted(poolContract, args[0]);
+      if (isExhausted) {
+        return null;
       }
     }
-
     let preparedTx = rpc.assembleTransaction(tx, simRes).build();
 
     // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
@@ -283,6 +311,12 @@ export class KallpaKeeperDaemon {
         .setTimeout(30)
         .build();
       const freshSim = await this.server.simulateTransaction(freshTx);
+      if (rpc.Api.isSimulationError(freshSim)) {
+        throw new Error(`Re-simulation after restoration failed: ${freshSim.error}`);
+      }
+      if (freshSim.restorePreamble && freshSim.restorePreamble.minResourceFee) {
+        throw new Error("Re-simulation unexpectedly required second restoration preamble");
+      }
       preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 

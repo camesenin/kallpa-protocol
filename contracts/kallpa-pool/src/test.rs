@@ -1365,4 +1365,73 @@ fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_au
     let replay_payout = setup2.client.claim_secondary_recovery(&setup2.investor1, &Some(10));
     assert_eq!(replay_payout, 0);
     assert_eq!(setup2.token_client.balance(&setup2.investor1), bal1_before + 60_0000000i128);
+
+
+
+}
+
+#[test]
+fn test_zero_payout_advances_cursor_and_unlocks_future_positive_tranche() {
+    let setup = setup_test();
+    let target = 1_000_000_000_0000000i128; // Large pool
+    let repayment_target = 1_200_000_000_0000000i128;
+    let funding_deadline = 1000u64;
+    let repayment_deadline = 5000u64;
+    let min_contribution = 10_000_000i128; // 1 USDC minimum
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Investor 1 deposits exactly min_contribution (1 USDC)
+    setup.token_admin.mint(&setup.investor1, &10_000_000i128);
+    setup.client.contribute(&setup.investor1, &10_000_000i128);
+
+    // Investor 2 deposits remaining to reach target
+    let inv2_amt = target - 10_000_000i128;
+    setup.token_admin.mint(&setup.investor2, &inv2_amt);
+    setup.client.contribute(&setup.investor2, &inv2_amt);
+
+    // Default pool
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
+    setup.client.declare_default(&setup.investor1);
+
+    // Add 25 micro tranches of 1 USDC each (10_000_000 stroops)
+    for _ in 0..25 {
+        setup.token_admin.mint(&setup.payer, &10_000_000i128);
+        setup.client.settle_repayment(&setup.payer, &10_000_000i128);
+    }
+
+    let (total_tranches, claimed_before) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(total_tranches, 25);
+    assert_eq!(claimed_before, 0);
+
+    // Claim first batch of 25 tranches: payout is 0, but cursor MUST advance to 25!
+    let payout_batch1 = setup.client.claim_secondary_recovery(&setup.investor1, &Some(25));
+    assert_eq!(payout_batch1, 0);
+
+    let (total_tranches_after, claimed_after) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(total_tranches_after, 25);
+    assert_eq!(claimed_after, 25);
+
+    // Add 26th tranche with substantial recovery: 1,000,000 USDC (10^13)
+    setup.token_admin.mint(&setup.payer, &1_000_000_0000000i128);
+    setup.client.settle_repayment(&setup.payer, &1_000_000_0000000i128);
+
+    let (total_tranches_26, _) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(total_tranches_26, 26);
+
+    let payout_batch2 = setup.client.claim_secondary_recovery(&setup.investor1, &Some(25));
+    assert!(payout_batch2 > 0);
+
+    let (_, claimed_final) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(claimed_final, 26);
 }
