@@ -97,26 +97,31 @@ export class KallpaKeeperDaemon {
     // 3. Fallback: If standalone RestoreFootprintOp is required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
       const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
-      const restoreTx = new TransactionBuilder(restoreAccount, {
+      const restoreTxBuilder = new TransactionBuilder(restoreAccount, {
         fee: simRes.restorePreamble.minResourceFee,
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(
           Operation.restoreFootprint({})
         )
-        .setTimeout(30)
-        .build();
+        .setTimeout(30);
 
+      // Crucial: Set sorobanData containing footprint & resources from restorePreamble
+      if (simRes.restorePreamble.transactionData) {
+        restoreTxBuilder.setSorobanData(simRes.restorePreamble.transactionData.build());
+      }
+
+      const restoreTx = restoreTxBuilder.build();
       restoreTx.sign(this.sponsorKey);
       const restoreSendRes = await this.server.sendTransaction(restoreTx);
       if (restoreSendRes.status === "ERROR") {
         throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
       }
       
-      // Wait for ledger confirmation of restore before proceeding with invocation
+      // Wait for strict SUCCESS on-chain confirmation before proceeding
       await this.waitForConfirmation(restoreSendRes.hash);
       
-      // Re-fetch sponsor account and re-simulate
+      // Re-fetch sponsor account and re-simulate invocation
       const freshAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const freshTx = new TransactionBuilder(freshAccount, {
         fee: "100000",
@@ -143,9 +148,10 @@ export class KallpaKeeperDaemon {
 
   /**
    * Poll RPC getTransaction until final inclusion status.
+   * Strictly verifies SUCCESS; fails on timeout or non-SUCCESS status.
    */
   private async waitForConfirmation(txHash: string): Promise<void> {
-    let attempts = 10;
+    let attempts = 15;
     while (attempts > 0) {
       const res = await this.server.getTransaction(txHash);
       if (res.status === "SUCCESS") {
@@ -154,8 +160,10 @@ export class KallpaKeeperDaemon {
       if (res.status === "FAILED") {
         throw new Error(`Transaction ${txHash} execution failed`);
       }
+      // NOT_FOUND or STILL_PENDING: wait and retry
       await new Promise((r) => setTimeout(r, 2000));
       attempts--;
     }
+    throw new Error(`Transaction ${txHash} confirmation timed out after 30 seconds`);
   }
 }
