@@ -31,6 +31,7 @@ impl KallpaPoolContract {
         tw_escrow: Address,
         payer: Address,
         target_amount: i128,
+        repayment_target: i128,
         deadline: u64,
         min_contribution: i128,
     ) -> Result<(), Error> {
@@ -39,7 +40,7 @@ impl KallpaPoolContract {
         if env.storage().instance().has(&DataKey::Config) {
             return Err(Error::AlreadyInitialized);
         }
-        if target_amount <= 0 || target_amount > MAX_MONETARY_CAP || min_contribution <= 0 || min_contribution > target_amount {
+        if target_amount <= 0 || target_amount > MAX_MONETARY_CAP || repayment_target < target_amount || repayment_target > MAX_MONETARY_CAP || min_contribution <= 0 || min_contribution > target_amount {
             return Err(Error::InvalidAmount);
         }
         if deadline <= env.ledger().timestamp() {
@@ -52,6 +53,7 @@ impl KallpaPoolContract {
             tw_escrow,
             payer,
             target_amount,
+            repayment_target,
             deadline,
             min_contribution,
         };
@@ -207,8 +209,8 @@ impl KallpaPoolContract {
         let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
         env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
 
-        // Once at least the principal target is reached, pool moves to Settled
-        if new_repaid >= config.target_amount {
+        // Once the full agreed obligation (principal + yield) is reached, pool moves to Settled
+        if new_repaid >= config.repayment_target {
             env.storage().instance().set(&DataKey::State, &PoolState::Settled);
         }
 
@@ -218,6 +220,8 @@ impl KallpaPoolContract {
 
     /// Admin can explicitly declare the pool Settled if repayment was partial or compromised,
     /// opening the pro-rata recovery claim flow for investors without blocking.
+    /// Admin can explicitly declare the pool Settled strictly if loan/escrow repayment deadline has expired
+    /// and borrower only partially repaid, safely transitioning to Settled to unblock pro-rata recovery.
     pub fn declare_settled(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
 
@@ -239,6 +243,12 @@ impl KallpaPoolContract {
 
         if state != PoolState::Funded {
             return Err(Error::PoolNotFunded);
+        }
+
+        // Bounded admin authority: Admin CANNOT declare early default before deadline has elapsed
+        let now = env.ledger().timestamp();
+        if now <= config.deadline {
+            return Err(Error::DeadlinePassed);
         }
 
         env.storage().instance().set(&DataKey::State, &PoolState::Settled);

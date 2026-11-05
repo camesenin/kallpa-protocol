@@ -139,6 +139,9 @@
                   "i128": "100000000000"
                 },
                 {
+                  "i128": "113377777777"
+                },
+                {
                   "u64": "3600"
                 },
                 {
@@ -899,6 +902,14 @@
                             },
                             "val": {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "repayment_target"
+                            },
+                            "val": {
+                              "i128": "113377777777"
                             }
                           },
                           {

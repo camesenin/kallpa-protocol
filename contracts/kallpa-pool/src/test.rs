@@ -73,13 +73,15 @@ fn test_successful_pool_lifecycle() {
     let deadline = setup.env.ledger().timestamp() + 3600; // 1 hour
     let min_contribution = 100_0000000i128; // 100 USDC
 
-    // 1. Initialize
+    // 1. Initialize with repayment_target = 11,000 USDC (target 10,000 + 10% yield)
+    let repayment_target = 11_000_0000000i128;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -150,12 +152,14 @@ fn test_refund_on_expired_deadline() {
     let deadline = setup.env.ledger().timestamp() + 1000;
     let min_contribution = 100_0000000i128;
 
+    let repayment_target = target;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -185,12 +189,14 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
     let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 1_0000000i128;
 
+    let repayment_target = 11_337_7777777i128;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -223,12 +229,14 @@ fn test_reject_multiple_deposits_per_address() {
     let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
+    let repayment_target = target;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -247,12 +255,14 @@ fn test_dispute_refund_flow() {
     let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
+    let repayment_target = target;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -287,12 +297,14 @@ fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
     let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
+    let repayment_target = 11_000_0000000i128;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -349,12 +361,14 @@ fn test_admin_declare_settled_on_partial_repayment() {
     let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
+    let repayment_target = 11_000_0000000i128;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -368,6 +382,13 @@ fn test_admin_declare_settled_on_partial_repayment() {
 
     let (_, state_funded, _, _) = setup.client.get_pool_info();
     assert_eq!(state_funded, PoolState::Funded);
+
+    // Attempting early declare_settled before deadline must fail
+    let early_res = setup.client.try_declare_settled(&setup.admin);
+    assert_eq!(early_res, Err(Ok(Error::DeadlinePassed)));
+
+    // Advance ledger past deadline to simulate loan default
+    setup.env.ledger().set_timestamp(deadline + 10);
 
     // Admin declares pool settled to release recovery funds to investors
     setup.client.declare_settled(&setup.admin);
@@ -393,12 +414,14 @@ fn test_late_repayment_rejected_after_settled() {
     let deadline = setup.env.ledger().timestamp() + 3600;
     let min_contribution = 100_0000000i128;
 
+    let repayment_target = 11_000_0000000i128;
     setup.client.initialize(
         &setup.admin,
         &setup.token_addr,
         &setup.tw_escrow,
         &setup.payer,
         &target,
+        &repayment_target,
         &deadline,
         &min_contribution,
     );
@@ -427,4 +450,59 @@ fn test_late_repayment_rejected_after_settled() {
     let p2 = setup.client.claim_return(&setup.investor2);
     assert_eq!(p2, 4_400_0000000i128);
     assert_eq!(p1 + p2, 11_000_0000000i128);
+}
+
+#[test]
+fn test_multi_tranche_repayment_reaches_repayment_target_with_yield() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128; // 10,000 USDC principal
+    let repayment_target = 11_000_0000000i128; // 11,000 USDC (10% agreed yield)
+    let deadline = setup.env.ledger().timestamp() + 3600;
+    let min_contribution = 100_0000000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &deadline,
+        &min_contribution,
+    );
+
+    // Investors fund target: Inv1 = 60%, Inv2 = 40%
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Funded);
+
+    // Tranche 1: Borrower repays 10,000 USDC (100% of principal)
+    let tranche1 = 10_000_0000000i128;
+    setup.client.settle_repayment(&setup.payer, &tranche1);
+
+    // Crucial check: pool must NOT prematurely settle upon recovering principal target!
+    // It remains in Funded state because repayment_target (11,000 USDC) has not been reached.
+    let (_, state_t1, _, repaid_t1) = setup.client.get_pool_info();
+    assert_eq!(state_t1, PoolState::Funded);
+    assert_eq!(repaid_t1, tranche1);
+
+    // Tranche 2: Borrower pays the remaining 1,000 USDC (agreed yield)
+    let tranche2 = 1_000_0000000i128;
+    setup.client.settle_repayment(&setup.payer, &tranche2);
+
+    // Now full repayment_target is reached -> state moves to Settled and R freezes at 11,000 USDC
+    let (_, state_t2, _, repaid_t2) = setup.client.get_pool_info();
+    assert_eq!(state_t2, PoolState::Settled);
+    assert_eq!(repaid_t2, repayment_target);
+
+    // Investors pull exact pro-rata share of principal + interest
+    let p1 = setup.client.claim_return(&setup.investor1);
+    assert_eq!(p1, 6_600_0000000i128); // 60% of 11,000
+
+    let p2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(p2, 4_400_0000000i128); // 40% of 11,000
+
+    assert_eq!(p1 + p2, repayment_target);
 }

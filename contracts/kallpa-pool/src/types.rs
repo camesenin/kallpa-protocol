@@ -41,6 +41,7 @@ pub struct PoolConfig {
     pub tw_escrow: Address,
     pub payer: Address,
     pub target_amount: i128,
+    pub repayment_target: i128,
     pub deadline: u64,
     pub min_contribution: i128,
 }

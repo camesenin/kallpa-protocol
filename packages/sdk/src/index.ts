@@ -9,6 +9,7 @@ export interface PoolConfig {
   twEscrow: string;
   payer: string;
   targetAmount: bigint;
+  repaymentTarget: bigint;
   deadline: number;
   minContribution: bigint;
 }

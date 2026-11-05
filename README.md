@@ -120,7 +120,7 @@ kallpa-protocol/
 ```bash
 cargo test --workspace
 ```
-*Current test suite: 8 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on partial recovery, and strict late repayment rejection after Settled).*
+*Current test suite: 9 passing unit tests (full lifecycle, deadline expiration refund, zero-dust telescoping pro-rata invariant, multiple deposit rejection guard, escrow dispute refund, multi-tranche repayment & dust attack mitigation, admin declare settled on bounded default, strict late repayment rejection after Settled, and multi-tranche repayment reaching repayment_target with yield).*
 
 ### 2. Run TypeScript SDK Tests
 ```bash
