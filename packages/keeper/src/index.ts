@@ -22,7 +22,7 @@ export interface KeeperConfig {
   sponsorSecret: string;
   poolContractIds: string[];
   maxTranchesPerBatch: number;
-  minSponsorReserveXlm: number; // e.g. 5 XLM safety threshold
+  minSponsorReserveStroops: bigint; // e.g. 50_000_000n (5 XLM safety threshold in stroops)
 }
 
 export interface InvestorClaimTarget {
@@ -43,20 +43,34 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Check sponsor XLM balance to ensure sufficient gas coverage.
+   * Check sponsor XLM balance using on-chain ledger entries via RPC getLedgerEntries.
+   * Parses AccountEntry to inspect exact native balance in stroops without Horizon dependency.
    */
-  async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceXlm: number }> {
-    const account = await this.server.getAccount(this.sponsorKey.publicKey());
-    // Find native balance
-    let nativeBalance = 0;
-    for (const b of (account as any).balances || []) {
-      if (b.asset_type === "native") {
-        nativeBalance = parseFloat(b.balance);
+  async checkSponsorSolvency(): Promise<{ solvent: boolean; balanceStroops: bigint }> {
+    try {
+      const accountId = this.sponsorKey.xdrAccountId();
+      const accountKey = xdr.LedgerKey.account(
+        new xdr.LedgerKeyAccount({ accountId })
+      );
+
+      const res = await this.server.getLedgerEntries([accountKey]);
+      if (res.entries && res.entries.length > 0) {
+        const entry = res.entries[0];
+        const leData = xdr.LedgerEntryData.fromXDR(entry.xdr, "base64");
+        const balance = leData.account().balance().toBigInt();
+        return {
+          solvent: balance >= this.config.minSponsorReserveStroops,
+          balanceStroops: balance,
+        };
       }
+    } catch (e) {
+      // Fallback: If querying fails in test or mock environment, allow execution if minimum is 0
+      console.warn("Could not query on-chain account entry, falling back:", e);
     }
+
     return {
-      solvent: nativeBalance >= this.config.minSponsorReserveXlm,
-      balanceXlm: nativeBalance,
+      solvent: this.config.minSponsorReserveStroops === 0n,
+      balanceStroops: 0n,
     };
   }
 
@@ -72,7 +86,7 @@ export class KallpaKeeperDaemon {
 
     const solvency = await this.checkSponsorSolvency();
     if (!solvency.solvent) {
-      console.warn(`Sponsor reserve low (${solvency.balanceXlm} XLM < ${this.config.minSponsorReserveXlm} XLM). Pausing sweep.`);
+      console.warn(`Sponsor reserve low (${solvency.balanceStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
       return { processed: 0, errors: 0, skippedForLowFunds: true };
     }
 
@@ -123,18 +137,19 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Route 3: Disburse secondary recovery tranche
+   * Route 3: Disburse secondary recovery tranche.
+   * In Soroban ABI: Option<u32> where value is present is encoded directly as scvU32(val).
    */
   async disburseSecondaryRecovery(
     poolContract: Contract,
     investor: string,
     maxTranches: number
   ): Promise<string> {
-    const tranchesVal = xdr.ScVal.scvU32(maxTranches);
-    const optVal = xdr.ScVal.scvVec([tranchesVal]); // Option::Some(maxTranches)
+    const boundedTranches = Math.max(1, Math.min(maxTranches, 50));
+    const tranchesVal = xdr.ScVal.scvU32(boundedTranches);
     return this.executePermissionlessCall(poolContract, "claim_secondary_recovery", [
       new Address(investor).toScVal(),
-      optVal,
+      tranchesVal,
     ]);
   }
 
@@ -148,8 +163,10 @@ export class KallpaKeeperDaemon {
   ): Promise<string> {
     const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
 
+    const baseInclusionFee = 100000n; // 0.01 XLM base inclusion fee
+
     const tx = new TransactionBuilder(sponsorAccount, {
-      fee: "100000",
+      fee: baseInclusionFee.toString(),
       networkPassphrase: this.config.networkPassphrase,
     })
       .addOperation(poolContract.call(method, ...args))
@@ -167,8 +184,11 @@ export class KallpaKeeperDaemon {
     // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
       const restoreAccount = await this.server.getAccount(this.sponsorKey.publicKey());
+      // Total fee = Base Inclusion Fee + Resource Restoration Fee
+      const totalRestoreFee = baseInclusionFee + BigInt(simRes.restorePreamble.minResourceFee);
+
       const restoreTxBuilder = new TransactionBuilder(restoreAccount, {
-        fee: simRes.restorePreamble.minResourceFee,
+        fee: totalRestoreFee.toString(),
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(Operation.restoreFootprint({}))
@@ -190,7 +210,7 @@ export class KallpaKeeperDaemon {
       // Re-fetch sequence and re-simulate
       const freshAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const freshTx = new TransactionBuilder(freshAccount, {
-        fee: "100000",
+        fee: baseInclusionFee.toString(),
         networkPassphrase: this.config.networkPassphrase,
       })
         .addOperation(poolContract.call(method, ...args))
@@ -213,13 +233,12 @@ export class KallpaKeeperDaemon {
   }
 
   /**
-   * Poll RPC getTransaction with wall-clock timeout and strict SUCCESS verification.
+   * Poll RPC getTransaction with wall-clock deadline and strict SUCCESS verification.
    */
   private async waitForConfirmation(txHash: string): Promise<void> {
-    const startTime = Date.now();
-    const timeoutMs = 45000; // 45s wall-clock timeout
+    const deadline = Date.now() + 45000; // Strict 45s wall-clock deadline
 
-    while (Date.now() - startTime < timeoutMs) {
+    while (Date.now() < deadline) {
       const res = await this.server.getTransaction(txHash);
       if (res.status === "SUCCESS") {
         return;
@@ -227,8 +246,12 @@ export class KallpaKeeperDaemon {
       if (res.status === "FAILED") {
         throw new Error(`Transaction ${txHash} execution failed on-chain`);
       }
+      // Check deadline before sleeping
+      if (Date.now() + 2000 > deadline) {
+        break;
+      }
       await new Promise((r) => setTimeout(r, 2000));
     }
-    throw new Error(`Transaction ${txHash} confirmation timed out after ${timeoutMs}ms`);
+    throw new Error(`Transaction ${txHash} confirmation timed out after 45s deadline`);
   }
 }
