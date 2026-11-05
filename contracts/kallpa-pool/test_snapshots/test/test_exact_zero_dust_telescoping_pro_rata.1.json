@@ -692,6 +692,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "cumulative_remainder"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "investor"
                     },
                     "val": {
@@ -768,6 +776,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "cumulative_remainder"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "investor"
                     },
                     "val": {
@@ -840,6 +856,14 @@
                     },
                     "val": {
                       "i128": "66666666666"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "cumulative_remainder"
+                    },
+                    "val": {
+                      "i128": "0"
                     }
                   },
                   {

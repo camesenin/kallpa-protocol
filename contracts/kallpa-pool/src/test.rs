@@ -70,7 +70,7 @@ fn setup_test<'a>() -> TestSetup<'a> {
 fn test_successful_pool_lifecycle() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
-        let min_contribution = 100_0000000i128; // 100 USDC
+        let min_contribution = 10_0000000i128; // 100 USDC
 
     // 1. Initialize with repayment_target = 11,000 USDC and dual deadlines
     let repayment_target = 11_000_0000000i128;
@@ -151,7 +151,7 @@ fn test_successful_pool_lifecycle() {
 fn test_refund_on_expired_deadline() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     let repayment_target = target;
     let funding_deadline = setup.env.ledger().timestamp() + 1000;
@@ -232,7 +232,7 @@ fn test_exact_zero_dust_telescoping_pro_rata() {
 fn test_reject_multiple_deposits_per_address() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     let repayment_target = target;
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
@@ -260,7 +260,7 @@ fn test_reject_multiple_deposits_per_address() {
 fn test_dispute_refund_flow() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     let repayment_target = target;
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
@@ -304,7 +304,7 @@ fn test_dispute_refund_flow() {
 fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     let repayment_target = 11_000_0000000i128;
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
@@ -370,7 +370,7 @@ fn test_multi_tranche_repayment_and_dust_attack_mitigation() {
 fn test_admin_declare_settled_on_partial_repayment() {
     let setup = setup_test();
     let target = 10_000_0000000i128;
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     let repayment_target = 11_000_0000000i128;
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
@@ -425,7 +425,7 @@ fn test_admin_declare_settled_on_partial_repayment() {
 fn test_late_repayment_routed_to_secondary_recovery_after_settled() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     let repayment_target = 11_000_0000000i128;
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
@@ -472,10 +472,10 @@ fn test_late_repayment_routed_to_secondary_recovery_after_settled() {
     assert_eq!(p1 + p2, 11_000_0000000i128);
 
     // Investors now claim their secondary recovery pro-rata (60% and 40% of 1,000 USDC)
-    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1);
+    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
     assert_eq!(sec1, 600_0000000i128);
 
-    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2);
+    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
     assert_eq!(sec2, 400_0000000i128);
     assert_eq!(sec1 + sec2, 1_000_0000000i128);
 }
@@ -487,7 +487,7 @@ fn test_multi_tranche_repayment_reaches_repayment_target_with_yield() {
     let repayment_target = 11_000_0000000i128; // 11,000 USDC (10% agreed yield)
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
     let repayment_deadline = funding_deadline + 86400;
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
 
     setup.client.initialize(
         &setup.admin,
@@ -542,7 +542,7 @@ fn test_post_default_secondary_recovery_flow() {
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
     let repayment_target = 11_000_0000000i128; // 11,000 USDC
-    let min_contribution = 100_0000000i128;
+    let min_contribution = 10_0000000i128;
     let funding_deadline = setup.env.ledger().timestamp() + 3600;
     let repayment_deadline = funding_deadline + 86400;
 
@@ -590,9 +590,9 @@ fn test_post_default_secondary_recovery_flow() {
     assert_eq!(primary_after, 5_000_0000000i128);
 
     // Investors claim their pro-rata of secondary recovery (60% of 3,000 = 1,800; 40% of 3,000 = 1,200)
-    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1);
+    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
     assert_eq!(sec1, 1_800_0000000i128);
-    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2);
+    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
     assert_eq!(sec2, 1_200_0000000i128);
     assert_eq!(sec1 + sec2, 3_000_0000000i128);
 
@@ -600,9 +600,9 @@ fn test_post_default_secondary_recovery_flow() {
     setup.client.settle_repayment(&setup.payer, &2_000_0000000i128);
 
     // Subsequent claims pull the incremental entitlement (60% of 2,000 = 1,200; 40% of 2,000 = 800)
-    let sec1_t2 = setup.client.claim_secondary_recovery(&setup.investor1);
+    let sec1_t2 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
     assert_eq!(sec1_t2, 1_200_0000000i128);
-    let sec2_t2 = setup.client.claim_secondary_recovery(&setup.investor2);
+    let sec2_t2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
     assert_eq!(sec2_t2, 800_0000000i128);
     assert_eq!(sec1_t2 + sec2_t2, 2_000_0000000i128);
 
@@ -611,4 +611,184 @@ fn test_post_default_secondary_recovery_flow() {
     // Total received by Inv2: 2,000 + 1,200 + 800 = 4,000 USDC (exact 40%)
     assert_eq!(p1 + sec1 + sec1_t2, 6_000_0000000i128);
     assert_eq!(p2 + sec2 + sec2_t2, 4_000_0000000i128);
+}
+
+
+#[test]
+fn test_secondary_recovery_pagination_and_batch_limits() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 10_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128); // 60%
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128); // 40%
+
+    // Full target repaid, pool settled
+    setup.client.settle_repayment(&setup.payer, &10_000_0000000i128);
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Settled);
+
+    // Primary claims
+    assert_eq!(setup.client.claim_return(&setup.investor1), 6_000_0000000i128);
+    assert_eq!(setup.client.claim_return(&setup.investor2), 4_000_0000000i128);
+
+    // Simulate 5 separate secondary recovery tranches (each 10 USDC = 100_0000000 stroops >= MIN_RECOVERY_TRANCHE)
+    for _ in 0..5 {
+        setup.client.settle_repayment(&setup.payer, &10_0000000i128);
+    }
+
+    // Investor 1 claims in batches of 2 tranches
+    // Batch 1: tranches 1..2 (20 USDC total -> 60% = 12 USDC)
+    let b1 = setup.client.claim_secondary_recovery(&setup.investor1, &Some(2));
+    assert_eq!(b1, 12_0000000i128);
+
+    let pos1 = setup.client.get_position(&setup.investor1).unwrap();
+    assert_eq!(pos1.claimed_tranches, 2);
+
+    // Batch 2: tranches 3..4 (20 USDC total -> 60% = 12 USDC)
+    let b2 = setup.client.claim_secondary_recovery(&setup.investor1, &Some(2));
+    assert_eq!(b2, 12_0000000i128);
+
+    let pos1 = setup.client.get_position(&setup.investor1).unwrap();
+    assert_eq!(pos1.claimed_tranches, 4);
+
+    // Batch 3: tranche 5 (10 USDC total -> 60% = 6 USDC)
+    let b3 = setup.client.claim_secondary_recovery(&setup.investor1, &Some(2));
+    assert_eq!(b3, 6_0000000i128);
+
+    let pos1 = setup.client.get_position(&setup.investor1).unwrap();
+    assert_eq!(pos1.claimed_tranches, 5);
+
+    // No more tranches left
+    let b4 = setup.client.claim_secondary_recovery(&setup.investor1, &Some(2));
+    assert_eq!(b4, 0i128);
+
+    // Total received by Inv1 across all 5 tranches: 12 + 12 + 6 = 30 USDC (exact 60% of 50 USDC)
+    assert_eq!(b1 + b2 + b3, 30_0000000i128);
+
+    // Investor 2 claims all remaining tranches at once (max_tranches = None defaults to 50)
+    let inv2_all = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(inv2_all, 20_0000000i128); // exact 40% of 50 USDC
+
+    // Conservation check: 30 + 20 = 50 USDC
+    assert_eq!(b1 + b2 + b3 + inv2_all, 50_0000000i128);
+}
+
+#[test]
+fn test_secondary_recovery_enforces_min_tranche_against_dust_fragmentation() {
+    let setup = setup_test();
+    let target = 10_000_0000000i128;
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 10_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    setup.client.contribute(&setup.investor1, &6_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &4_000_0000000i128);
+
+    setup.client.settle_repayment(&setup.payer, &10_000_0000000i128);
+
+    // Attempting to post a micro-tranche of 1 stroop (0.0000001 USDC < MIN_RECOVERY_TRANCHE of 1.0 USDC)
+    // fails with AmountBelowMinRecovery
+    let res = setup.client.try_settle_repayment(&setup.payer, &1i128);
+    assert_eq!(res, Err(Ok(Error::AmountBelowMinRecovery)));
+
+    // Attempting to post 0.5 USDC (5_000_000 stroops < 10_000_000) also fails
+    let res_half = setup.client.try_settle_repayment(&setup.payer, &5_000_000i128);
+    assert_eq!(res_half, Err(Ok(Error::AmountBelowMinRecovery)));
+
+    // Posting exactly MIN_RECOVERY_TRANCHE (10_000_000 stroops = 1.0 USDC) succeeds
+    let res_valid = setup.client.try_settle_repayment(&setup.payer, &10_000_000i128);
+    assert!(res_valid.is_ok());
+}
+
+
+#[test]
+fn test_tw_escrow_lifecycle_and_non_cooperative_dispute_return() {
+    // Verifies upstream Trustless Work integration architecture resolving B08:
+    // 1. Contributors pool funds into KallpaPool
+    // 2. Pool releases funds to Trustless Work Escrow (address authenticated)
+    // 3. Upstream dispute is resolved; Trustless Work invokes handle_dispute_refund directly
+    // 4. Returns exactly once without admin middleman or double-draw
+    // 5. Investors claim pro-rata shares with zero residual dust
+    let setup = setup_test();
+    let target = 10_000_0000000i128; // 10,000 USDC
+    let repayment_target = 10_000_0000000i128;
+    let min_contribution = 100_0000000i128;
+    let funding_deadline = setup.env.ledger().timestamp() + 3600;
+    let repayment_deadline = funding_deadline + 86400;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Contributor 1 deposits 7,000 USDC (70%), Contributor 2 deposits 3,000 USDC (30%)
+    setup.client.contribute(&setup.investor1, &7_000_0000000i128);
+    setup.client.contribute(&setup.investor2, &3_000_0000000i128);
+
+    // Target reached -> Pool moves to Funded, releasing capital to Trustless Work Escrow
+    let (_, state, total_collected, _) = setup.client.get_pool_info();
+    assert_eq!(state, PoolState::Funded);
+    assert_eq!(total_collected, target);
+    assert_eq!(setup.token_client.balance(&setup.tw_escrow), target);
+
+    // Mint tokens to TW escrow so it can return dispute funds directly
+    // (Simulating TW contract releasing held funds back to depositor upon Arbiter dispute ruling)
+    setup.token_admin.mint(&setup.tw_escrow, &8_000_0000000i128);
+
+    // Scenario A: Unauthorized third party or rogue borrower attempts to call handle_dispute_refund
+    let rogue = Address::generate(&setup.env);
+    let rogue_res = setup.client.try_handle_dispute_refund(&rogue, &5_000_0000000i128);
+    assert_eq!(rogue_res, Err(Ok(Error::Unauthorized)));
+
+    // Scenario B: TW Escrow directly invokes handle_dispute_refund with 8,000 USDC (80% recovery)
+    // No reliance on admin signature or approver benevolence
+    let tw_res = setup.client.try_handle_dispute_refund(&setup.tw_escrow, &8_000_0000000i128);
+    assert!(tw_res.is_ok());
+
+    let (_, state_after, _, total_repaid) = setup.client.get_pool_info();
+    assert_eq!(state_after, PoolState::Disputed);
+    assert_eq!(total_repaid, 8_000_0000000i128);
+
+    // Pro-rata distribution: 70% of 8,000 = 5,600 USDC, 30% of 8,000 = 2,400 USDC
+    let p1 = setup.client.claim_return(&setup.investor1);
+    let p2 = setup.client.claim_return(&setup.investor2);
+    assert_eq!(p1, 5_600_0000000i128);
+    assert_eq!(p2, 2_400_0000000i128);
+    assert_eq!(p1 + p2, 8_000_0000000i128);
 }

@@ -21,6 +21,8 @@ export interface InvestorPosition {
   cumPrior: bigint;
   cumAfter: bigint;
   claimed: boolean;
+  claimedTranches: number;
+  cumulativeRemainder: bigint;
 }
 
 export enum PoolState {

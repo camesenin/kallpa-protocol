@@ -21,6 +21,8 @@ pub enum Error {
     PoolNotDisputed = 15,
     PoolAlreadySettled = 16,
     RepaymentDeadlinePassed = 17,
+    AmountBelowMinRecovery = 18,
+    BatchLimitExceeded = 19,
 }
 
 #[contracttype]
@@ -57,6 +59,7 @@ pub struct Position {
     pub cum_after: i128,
     pub claimed: bool,
     pub claimed_tranches: u32,
+    pub cumulative_remainder: i128,
 }
 
 #[contracttype]

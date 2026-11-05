@@ -18,6 +18,12 @@ const PERSISTENT_LIFETIME_THRESHOLD: u32 = 14 * DAY_IN_LEDGERS;
 // Maximum intermediate multiplication cap to guarantee i128 intermediate products never overflow
 const MAX_MONETARY_CAP: i128 = 10_000_000_000_000_000_000i128; // 10^19 stroops (1 trillion USDC)
 
+// Minimum recovery tranche size to eliminate fractional rounding distortion and griefing
+const MIN_RECOVERY_TRANCHE: i128 = 10_000_000i128; // 1.0 USDC (7 decimals)
+
+// Maximum tranches processed per paginated batch claim
+const MAX_BATCH_CLAIM_TRANCHES: u32 = 50;
+
 #[contract]
 pub struct KallpaPoolContract;
 
@@ -27,6 +33,9 @@ impl KallpaPoolContract {
         if amount <= 0 {
             return Ok(());
         }
+        if amount < MIN_RECOVERY_TRANCHE {
+            return Err(Error::AmountBelowMinRecovery);
+        }
         let count: u32 = env
             .storage()
             .instance()
@@ -34,7 +43,9 @@ impl KallpaPoolContract {
             .unwrap_or(0);
         let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
         env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-        env.storage().instance().set(&DataKey::SecondaryTranche(new_count), &amount);
+        let tranche_key = DataKey::SecondaryTranche(new_count);
+        env.storage().persistent().set(&tranche_key, &amount);
+        env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(())
     }
 
@@ -158,6 +169,7 @@ impl KallpaPoolContract {
             cum_after: new_total,
             claimed: false,
             claimed_tranches: 0,
+            cumulative_remainder: 0,
         };
 
         env.storage().persistent().set(&position_key, &position);
@@ -522,7 +534,11 @@ impl KallpaPoolContract {
     /// Evaluates each discrete immutable secondary tranche independently:
     /// Payout_{i,k} = floor(cum_after_i * S_k / T) - floor(cum_prior_i * S_k / T)
     /// Guarantees strict monotonicity, order-independence, and zero-dust exact conservation.
-    pub fn claim_secondary_recovery(env: Env, investor: Address) -> Result<i128, Error> {
+    pub fn claim_secondary_recovery(
+        env: Env,
+        investor: Address,
+        max_tranches: Option<u32>,
+    ) -> Result<i128, Error> {
         investor.require_auth();
 
         let config: PoolConfig = env
@@ -564,13 +580,21 @@ impl KallpaPoolContract {
             return Ok(0);
         }
 
-        let mut total_payout: i128 = 0;
+        let requested_batch = max_tranches.unwrap_or(MAX_BATCH_CLAIM_TRANCHES);
+        if requested_batch == 0 || requested_batch > MAX_BATCH_CLAIM_TRANCHES {
+            return Err(Error::BatchLimitExceeded);
+        }
+
         let start = position.claimed_tranches + 1;
-        for tranche_idx in start..=total_tranches {
+        let end = (position.claimed_tranches + requested_batch).min(total_tranches);
+
+        let mut total_payout: i128 = 0;
+        for tranche_idx in start..=end {
+            let tranche_key = DataKey::SecondaryTranche(tranche_idx);
             let tranche_amount: i128 = env
                 .storage()
-                .instance()
-                .get(&DataKey::SecondaryTranche(tranche_idx))
+                .persistent()
+                .get(&tranche_key)
                 .unwrap_or(0);
 
             if tranche_amount > 0 {
@@ -590,10 +614,17 @@ impl KallpaPoolContract {
 
                 let payout = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
                 total_payout = total_payout.checked_add(payout).ok_or(Error::MathOverflow)?;
+
+                // Extend TTL for visited persistent tranche entry
+                env.storage().persistent().extend_ttl(
+                    &tranche_key,
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
             }
         }
 
-        position.claimed_tranches = total_tranches;
+        position.claimed_tranches = end;
         env.storage().persistent().set(&position_key, &position);
         env.storage().persistent().extend_ttl(
             &position_key,
