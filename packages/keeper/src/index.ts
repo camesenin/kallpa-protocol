@@ -35,6 +35,12 @@ export interface InvestorClaimTarget {
   maxTranches?: number;
 }
 
+export interface ClaimExecutionReceipt {
+  txHash: string | null;
+  feeSpentStroops: bigint;
+  payoutStroops: bigint;
+}
+
 export class KallpaKeeperDaemon {
   private server: rpc.Server;
   private sponsorKey: Keypair;
@@ -109,14 +115,22 @@ export class KallpaKeeperDaemon {
    */
   async runSweepCycle(
     targetsByPool: Map<string, InvestorClaimTarget[]>
-  ): Promise<{ processed: number; errors: number; skippedForLowFunds: boolean; skippedZeroPayout: number; totalFeeSpentStroops: bigint }> {
+  ): Promise<{
+    processed: number;
+    errors: number;
+    skippedForLowFunds: boolean;
+    skippedExhausted: number;
+    confirmedZeroPayoutAdvancements: number;
+    totalFeeSpentStroops: bigint;
+  }> {
     let processed = 0;
     let errors = 0;
-    let skippedZeroPayout = 0;
+    let skippedExhausted = 0;
+    let confirmedZeroPayoutAdvancements = 0;
     let totalFeeSpentStroops = 0n;
 
     const maxSweepBudget = this.config.maxSweepBudgetStroops ?? 50_000_000n; // Default 5 XLM ceiling per cycle
-    const maxZeroPayouts = this.config.maxZeroPayoutTranchesPerCycle ?? 100; // Bound unmonetized advancement subsidies
+    const maxZeroPayouts = this.config.maxZeroPayoutTranchesPerCycle ?? 100; // Bound unmonetized zero-payout advancement subsidies
 
     for (const poolId of this.config.poolContractIds) {
       const targets = targetsByPool.get(poolId) || [];
@@ -126,49 +140,61 @@ export class KallpaKeeperDaemon {
         const solvency = await this.checkSponsorSolvency();
         if (!solvency.solvent) {
           console.warn(`Sponsor reserve low (${solvency.availableStroops} stroops < ${this.config.minSponsorReserveStroops} stroops). Pausing sweep.`);
-          return { processed, errors, skippedForLowFunds: true, skippedZeroPayout, totalFeeSpentStroops };
+          return { processed, errors, skippedForLowFunds: true, skippedExhausted, confirmedZeroPayoutAdvancements, totalFeeSpentStroops };
         }
 
-        // Check cumulative cycle budget ceiling
+        // Strict Pre-Flight Budget Reservation:
+        // Do NOT proceed if total spent plus remaining capacity cannot accommodate another transaction!
         if (totalFeeSpentStroops >= maxSweepBudget) {
           console.warn(`Cumulative sweep budget ceiling reached (${totalFeeSpentStroops} >= ${maxSweepBudget} stroops). Pausing cycle.`);
-          return { processed, errors, skippedForLowFunds: false, skippedZeroPayout, totalFeeSpentStroops };
+          return { processed, errors, skippedForLowFunds: false, skippedExhausted, confirmedZeroPayoutAdvancements, totalFeeSpentStroops };
         }
 
+        const remainingBudget = maxSweepBudget - totalFeeSpentStroops;
+
         try {
-          let result: { txHash: string | null; feeSpentStroops: bigint } = { txHash: null, feeSpentStroops: 0n };
+          let receipt: ClaimExecutionReceipt = { txHash: null, feeSpentStroops: 0n, payoutStroops: 0n };
+
           if (target.action === "claim_return") {
-            result = await this.disburseClaimReturnWithReceipt(poolContract, target.investor);
+            receipt = await this.disburseClaimReturnWithReceipt(poolContract, target.investor, remainingBudget);
           } else if (target.action === "refund") {
-            result = await this.disburseRefundWithReceipt(poolContract, target.investor);
+            receipt = await this.disburseRefundWithReceipt(poolContract, target.investor, remainingBudget);
           } else if (target.action === "claim_secondary") {
-            if (skippedZeroPayout >= maxZeroPayouts) {
-              console.warn(`Max zero payout subsidized advancements reached (${skippedZeroPayout} >= ${maxZeroPayouts}).`);
+            if (confirmedZeroPayoutAdvancements >= maxZeroPayouts) {
+              console.warn(`Max zero payout subsidized advancements reached (${confirmedZeroPayoutAdvancements} >= ${maxZeroPayouts}).`);
               continue;
             }
             const tranches = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
-            result = await this.disburseSecondaryRecoveryWithReceipt(
+            receipt = await this.disburseSecondaryRecoveryWithReceipt(
               poolContract,
               target.investor,
-              tranches
+              tranches,
+              remainingBudget
             );
           }
 
-          totalFeeSpentStroops += result.feeSpentStroops;
+          totalFeeSpentStroops += receipt.feeSpentStroops;
 
-          if (result.txHash === null) {
-            skippedZeroPayout++;
+          if (receipt.txHash === null) {
+            skippedExhausted++;
           } else {
             processed++;
+            if (receipt.payoutStroops === 0n) {
+              confirmedZeroPayoutAdvancements++;
+            }
           }
-        } catch (err) {
+        } catch (err: any) {
           console.error(`Failed disbursing ${target.action} for ${target.investor}:`, err);
           errors++;
+          // If transaction committed fee before failure, account for committed fee
+          if (err && typeof err.committedFeeStroops === "bigint") {
+            totalFeeSpentStroops += err.committedFeeStroops;
+          }
         }
       }
     }
 
-    return { processed, errors, skippedForLowFunds: false, skippedZeroPayout, totalFeeSpentStroops };
+    return { processed, errors, skippedForLowFunds: false, skippedExhausted, confirmedZeroPayoutAdvancements, totalFeeSpentStroops };
   }
 
   /**
@@ -179,10 +205,17 @@ export class KallpaKeeperDaemon {
     return res.txHash;
   }
 
-  async disburseClaimReturnWithReceipt(poolContract: Contract, investor: string): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
-    return this.executePermissionlessCall(poolContract, "claim_return", [
-      new Address(investor).toScVal(),
-    ]);
+  async disburseClaimReturnWithReceipt(
+    poolContract: Contract,
+    investor: string,
+    remainingBudget?: bigint
+  ): Promise<ClaimExecutionReceipt> {
+    return this.executePermissionlessCall(
+      poolContract,
+      "claim_return",
+      [new Address(investor).toScVal()],
+      remainingBudget
+    );
   }
 
   /**
@@ -193,10 +226,17 @@ export class KallpaKeeperDaemon {
     return res.txHash;
   }
 
-  async disburseRefundWithReceipt(poolContract: Contract, investor: string): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
-    return this.executePermissionlessCall(poolContract, "refund", [
-      new Address(investor).toScVal(),
-    ]);
+  async disburseRefundWithReceipt(
+    poolContract: Contract,
+    investor: string,
+    remainingBudget?: bigint
+  ): Promise<ClaimExecutionReceipt> {
+    return this.executePermissionlessCall(
+      poolContract,
+      "refund",
+      [new Address(investor).toScVal()],
+      remainingBudget
+    );
   }
 
   /**
@@ -215,17 +255,20 @@ export class KallpaKeeperDaemon {
   async disburseSecondaryRecoveryWithReceipt(
     poolContract: Contract,
     investor: string,
-    maxTranches: number
-  ): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
+    maxTranches: number,
+    remainingBudget?: bigint
+  ): Promise<ClaimExecutionReceipt> {
     if (typeof maxTranches !== "number" || !Number.isInteger(maxTranches) || maxTranches < 1 || maxTranches > 50) {
       throw new Error(`Invalid maxTranches: ${maxTranches}. Must be an integer between 1 and 50.`);
     }
 
     const tranchesVal = xdr.ScVal.scvU32(maxTranches);
-    return this.executePermissionlessCall(poolContract, "claim_secondary_recovery", [
-      new Address(investor).toScVal(),
-      tranchesVal,
-    ]);
+    return this.executePermissionlessCall(
+      poolContract,
+      "claim_secondary_recovery",
+      [new Address(investor).toScVal(), tranchesVal],
+      remainingBudget
+    );
   }
 
   /**
@@ -273,10 +316,12 @@ export class KallpaKeeperDaemon {
   private async executePermissionlessCall(
     poolContract: Contract,
     method: string,
-    args: xdr.ScVal[]
-  ): Promise<{ txHash: string | null; feeSpentStroops: bigint }> {
+    args: xdr.ScVal[],
+    remainingBudget?: bigint
+  ): Promise<ClaimExecutionReceipt> {
     const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
     const baseInclusionFee = 100000n; // 0.01 XLM base inclusion fee
+    const maxFeeLimit = this.config.maxFeePerTxStroops ?? 5_000_000n; // 0.5 XLM default max fee ceiling
 
     const tx = new TransactionBuilder(sponsorAccount, {
       fee: baseInclusionFee.toString(),
@@ -295,14 +340,31 @@ export class KallpaKeeperDaemon {
     // Critical Progress Guard:
     // If calling claim_secondary_recovery, only short-circuit if the investor is ALREADY fully claimed
     // (total_tranches <= claimed_tranches). If unvisited tranches exist, the transaction MUST be submitted
-    // on-chain to advance position.claimed_tranches cursor, preventing infinite stalling on zero-payout micro-tranches!
+    // on-chain to advance position.claimed_tranches cursor!
     if (method === "claim_secondary_recovery" && args.length > 0) {
       const isExhausted = await this.isSecondaryClaimExhausted(poolContract, args[0]);
       if (isExhausted) {
-        return { txHash: null, feeSpentStroops: 0n };
+        return { txHash: null, feeSpentStroops: 0n, payoutStroops: 0n };
       }
     }
+
+    // Parse simulated payout amount
+    let simulatedPayout = 0n;
+    if (simRes.result && simRes.result.retval) {
+      try {
+        const val = simRes.result.retval;
+        if (val.switch().value === xdr.ScValType.scvI128().value) {
+          const lo = val.i128().lo().toBigInt();
+          const hi = val.i128().hi().toBigInt();
+          simulatedPayout = (hi << 64n) + lo;
+        }
+      } catch (e) {
+        // Fallback: leave 0n if parse fails
+      }
+    }
+
     let preparedTx = rpc.assembleTransaction(tx, simRes).build();
+    let totalCommittedFee = 0n;
 
     // 2. Standalone RestoreFootprintOp handling if required by restorePreamble
     if (simRes.restorePreamble && simRes.restorePreamble.minResourceFee) {
@@ -323,6 +385,20 @@ export class KallpaKeeperDaemon {
       const restoreTx = restoreTxBuilder.build();
       const definitiveRestoreFee = BigInt(restoreTx.fee);
 
+      // STRICT POLICY: Enforce maxFeePerTxStroops on restoration envelope!
+      if (definitiveRestoreFee > maxFeeLimit) {
+        throw new Error(
+          `Restoration envelope fee exceeds maximum allowable per-transaction policy: fee ${definitiveRestoreFee} > maxFeeLimit ${maxFeeLimit}`
+        );
+      }
+
+      // STRICT PRE-FLIGHT CYCLE BUDGET: Verify restoration fee does not exceed cycle remaining budget
+      if (remainingBudget !== undefined && definitiveRestoreFee > remainingBudget) {
+        throw new Error(
+          `Restoration fee exceeds remaining cycle budget: fee ${definitiveRestoreFee} > remaining ${remainingBudget}`
+        );
+      }
+
       // Verify definitive envelope fee against available balance
       const preRestoreSolvency = await this.checkSponsorSolvency();
       if (preRestoreSolvency.availableStroops < definitiveRestoreFee + this.config.minSponsorReserveStroops) {
@@ -337,7 +413,14 @@ export class KallpaKeeperDaemon {
         throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
       }
 
-      await this.waitForConfirmation(restoreSendRes.hash);
+      try {
+        await this.waitForConfirmation(restoreSendRes.hash);
+        totalCommittedFee += definitiveRestoreFee;
+      } catch (err: any) {
+        // Track committed fee on failure
+        err.committedFeeStroops = definitiveRestoreFee;
+        throw err;
+      }
 
       // Re-fetch sequence and re-simulate invocation
       const freshAccount = await this.server.getAccount(this.sponsorKey.publicKey());
@@ -358,14 +441,21 @@ export class KallpaKeeperDaemon {
       preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
     }
 
-    // 3. Strict definitive envelope budget check & per-tx fee policy:
+    // 3. Strict definitive envelope budget check & per-tx fee policy on invocation:
     const definitiveEnvelopeFee = BigInt(preparedTx.fee);
-    const maxFeeLimit = this.config.maxFeePerTxStroops ?? 5_000_000n; // 0.5 XLM default max fee ceiling
     if (definitiveEnvelopeFee > maxFeeLimit) {
       throw new Error(
         `Envelope fee exceeds maximum allowable per-transaction policy: fee ${definitiveEnvelopeFee} > maxFeeLimit ${maxFeeLimit}`
       );
     }
+
+    // STRICT PRE-FLIGHT CYCLE BUDGET: Verify total combined fee (restoration + invocation) fits remainingBudget
+    if (remainingBudget !== undefined && totalCommittedFee + definitiveEnvelopeFee > remainingBudget) {
+      throw new Error(
+        `Total combined claim fee exceeds remaining cycle budget: combined ${totalCommittedFee + definitiveEnvelopeFee} > remaining ${remainingBudget}`
+      );
+    }
+
     const preSendSolvency = await this.checkSponsorSolvency();
     if (preSendSolvency.availableStroops < definitiveEnvelopeFee + this.config.minSponsorReserveStroops) {
       throw new Error(
@@ -380,8 +470,19 @@ export class KallpaKeeperDaemon {
       throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
     }
 
-    await this.waitForConfirmation(sendRes.hash);
-    return { txHash: sendRes.hash, feeSpentStroops: definitiveEnvelopeFee };
+    try {
+      await this.waitForConfirmation(sendRes.hash);
+      totalCommittedFee += definitiveEnvelopeFee;
+    } catch (err: any) {
+      err.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
+      throw err;
+    }
+
+    return {
+      txHash: sendRes.hash,
+      feeSpentStroops: totalCommittedFee,
+      payoutStroops: simulatedPayout,
+    };
   }
 
   /**

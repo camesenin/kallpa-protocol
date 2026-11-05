@@ -152,10 +152,10 @@ describe("@kallpa/keeper", () => {
     ).rejects.toThrow("Envelope fee exceeds maximum allowable per-transaction policy");
   });
 
-  it("enforces cumulative maxSweepBudgetStroops in runSweepCycle", async () => {
+  it("strictly enforces that next transaction does not exceed remaining sweep budget (e.g. 300k budget with 200k tx stops at 1 tx)", async () => {
     const tightSweepConfig: KeeperConfig = {
       ...dummyConfig,
-      maxSweepBudgetStroops: 200_000n, // Only enough for 1 transaction
+      maxSweepBudgetStroops: 300_000n, // Budget: 300k
     };
     const daemon = new KallpaKeeperDaemon(tightSweepConfig);
     const poolId = tightSweepConfig.poolContractIds[0];
@@ -167,11 +167,18 @@ describe("@kallpa/keeper", () => {
       availableStroops: 80_000_000n,
     });
 
-    // Mock disburseClaimReturnWithReceipt
     let callCount = 0;
-    (daemon as any).disburseClaimReturnWithReceipt = async () => {
+    (daemon as any).disburseClaimReturnWithReceipt = async (
+      _contract: any,
+      _investor: any,
+      remainingBudget: bigint
+    ) => {
+      const fee = 200_000n;
+      if (fee > remainingBudget) {
+        throw new Error(`Total combined claim fee exceeds remaining cycle budget: combined ${fee} > remaining ${remainingBudget}`);
+      }
       callCount++;
-      return { txHash: "mockHash" + callCount, feeSpentStroops: 200_000n };
+      return { txHash: "mockHash" + callCount, feeSpentStroops: fee, payoutStroops: 1000n };
     };
 
     const targets = new Map([
@@ -180,14 +187,53 @@ describe("@kallpa/keeper", () => {
         [
           { investor: Keypair.random().publicKey(), action: "claim_return" as const },
           { investor: Keypair.random().publicKey(), action: "claim_return" as const },
-          { investor: Keypair.random().publicKey(), action: "claim_return" as const },
         ],
       ],
     ]);
 
     const result = await daemon.runSweepCycle(targets);
-    expect(callCount).toBe(1); // Stopped after first tx reached cumulative budget!
+    // First tx spent 200k. Second tx requires 200k but remaining budget is only 100k (300k - 200k).
+    // Second tx fails pre-flight budget check and is caught without exceeding the 300k ceiling!
+    expect(callCount).toBe(1);
     expect(result.processed).toBe(1);
+    expect(result.totalFeeSpentStroops).toBe(200_000n);
+    expect(result.totalFeeSpentStroops <= 300_000n).toBe(true);
+  });
+
+  it("accurately counts confirmed zero payout advancements vs exhausted skips", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const poolId = dummyConfig.poolContractIds[0];
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    (daemon as any).disburseSecondaryRecoveryWithReceipt = async (
+      _contract: any,
+      _investor: any,
+      _tranches: number,
+      _remaining: bigint
+    ) => {
+      // Confirmed on-chain advancement with 0 payout
+      return { txHash: "mockHashAdvancement", feeSpentStroops: 100_000n, payoutStroops: 0n };
+    };
+
+    const targets = new Map([
+      [
+        poolId,
+        [
+          { investor: Keypair.random().publicKey(), action: "claim_secondary" as const },
+          { investor: Keypair.random().publicKey(), action: "claim_secondary" as const },
+        ],
+      ],
+    ]);
+
+    const result = await daemon.runSweepCycle(targets);
+    expect(result.processed).toBe(2);
+    expect(result.confirmedZeroPayoutAdvancements).toBe(2);
+    expect(result.skippedExhausted).toBe(0);
     expect(result.totalFeeSpentStroops).toBe(200_000n);
   });
 });
