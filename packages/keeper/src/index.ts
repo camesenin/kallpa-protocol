@@ -36,6 +36,12 @@ export interface InvestorClaimTarget {
   maxTranches?: number;
 }
 
+export enum ClaimPayoutType {
+  Positive = "POSITIVE",
+  Zero = "ZERO",
+  Unknown = "UNKNOWN",
+}
+
 export interface ClaimExecutionReceipt {
   txHash: string | null;
   committedFeeStroops: bigint; // Maximum committed envelope fee reserved before dispatch
@@ -208,14 +214,16 @@ export class KallpaKeeperDaemon {
             continue;
           }
           if (confirmedZeroPayoutAdvancements >= maxZeroPayouts) {
-            // Check if this claim yields a positive payout via simulation
-            const isZeroPayout = await this.isClaimZeroPayout(
+            // Ternary payout classification: do NOT treat Unknown simulation failures as Positive!
+            const payoutType = await this.isClaimZeroPayout(
               poolContract,
               "claim_secondary_recovery",
               [investorVal, xdr.ScVal.scvU32(target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch)]
             );
-            if (isZeroPayout) {
-              console.warn(`Max zero payout subsidized advancements reached (${confirmedZeroPayoutAdvancements} >= ${maxZeroPayouts}). Skipping zero-payout claim for ${target.investor}.`);
+            if (payoutType === ClaimPayoutType.Zero || payoutType === ClaimPayoutType.Unknown) {
+              console.warn(
+                `Max zero payout subsidized advancements reached (${confirmedZeroPayoutAdvancements} >= ${maxZeroPayouts}). Skipping ${payoutType} claim for ${target.investor}.`
+              );
               continue;
             }
           }
@@ -254,7 +262,8 @@ export class KallpaKeeperDaemon {
           } else {
             processed++;
             if (receipt.payoutStroops === 0n && target.action === "claim_secondary") {
-              confirmedZeroPayoutAdvancements++;
+              const tranchesAdvanced = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
+              confirmedZeroPayoutAdvancements += tranchesAdvanced;
             }
           }
         } catch (err: any) {
@@ -397,11 +406,16 @@ export class KallpaKeeperDaemon {
   /**
    * Check if a claim produces 0 payout via simulation
    */
-  private async isClaimZeroPayout(
+  /**
+   * Check claim payout status via simulation.
+   * Returns ternary ClaimPayoutType (Positive, Zero, or Unknown)
+   * to strictly prevent treating RPC/simulation errors as positive payouts.
+   */
+  public async isClaimZeroPayout(
     poolContract: Contract,
     method: string,
     args: xdr.ScVal[]
-  ): Promise<boolean> {
+  ): Promise<ClaimPayoutType> {
     try {
       const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const tx = new TransactionBuilder(sponsorAccount, {
@@ -415,12 +429,13 @@ export class KallpaKeeperDaemon {
       const simRes = await this.server.simulateTransaction(tx);
       if (simRes.result && simRes.result.retval) {
         const payout = this.parseScValAmount(simRes.result.retval);
-        return payout === 0n;
+        return payout === 0n ? ClaimPayoutType.Zero : ClaimPayoutType.Positive;
       }
     } catch (e) {
-      // Fallback: assume non-zero if inspection fails
+      // Fallback: inspection error -> Unknown
+      return ClaimPayoutType.Unknown;
     }
-    return false;
+    return ClaimPayoutType.Unknown;
   }
 
   private async executePermissionlessCall(
@@ -518,7 +533,14 @@ export class KallpaKeeperDaemon {
       }
 
       restoreTx.sign(this.sponsorKey);
-      const restoreSendRes = await this.server.sendTransaction(restoreTx);
+      let restoreSendRes: rpc.Api.SendTransactionResponse;
+      try {
+        restoreSendRes = await this.server.sendTransaction(restoreTx);
+      } catch (transportErr: any) {
+        transportErr.committedFeeStroops = definitiveRestoreFee;
+        transportErr.effectiveFeeStroops = definitiveRestoreFee;
+        throw transportErr;
+      }
       if (restoreSendRes.status === "ERROR") {
         throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
       }
@@ -561,63 +583,63 @@ export class KallpaKeeperDaemon {
       }
     }
 
-    // 3. Strict definitive envelope budget check & per-tx fee policy on invocation:
-    const definitiveEnvelopeFee = BigInt(preparedTx.fee);
-    if (definitiveEnvelopeFee > maxFeeLimit) {
-      const err: any = new Error(
-        `Envelope fee exceeds maximum allowable per-transaction policy: fee ${definitiveEnvelopeFee} > maxFeeLimit ${maxFeeLimit}`
-      );
-      err.committedFeeStroops = totalCommittedFee;
-      err.effectiveFeeStroops = totalEffectiveFee;
-      throw err;
-    }
-
-    // STRICT PRE-FLIGHT CYCLE BUDGET: Verify total combined fee (restoration + invocation) fits remainingBudget
-    if (remainingBudget !== undefined && totalCommittedFee + definitiveEnvelopeFee > remainingBudget) {
-      const err: any = new Error(
-        `Total combined claim fee exceeds remaining cycle budget: combined ${totalCommittedFee + definitiveEnvelopeFee} > remaining ${remainingBudget}`
-      );
-      err.committedFeeStroops = totalCommittedFee;
-      err.effectiveFeeStroops = totalEffectiveFee;
-      throw err;
-    }
-
-    const preSendSolvency = await this.checkSponsorSolvency();
-    if (preSendSolvency.availableStroops < definitiveEnvelopeFee + this.config.minSponsorReserveStroops) {
-      const err: any = new Error(
-        `Insufficient sponsor balance for assembled invocation: available ${preSendSolvency.availableStroops} < required ${definitiveEnvelopeFee + this.config.minSponsorReserveStroops} (fee: ${definitiveEnvelopeFee}, reserve: ${this.config.minSponsorReserveStroops})`
-      );
-      err.committedFeeStroops = totalCommittedFee;
-      err.effectiveFeeStroops = totalEffectiveFee;
-      throw err;
-    }
-
-    preparedTx.sign(this.sponsorKey);
-    let sendRes: rpc.Api.SendTransactionResponse;
-    try {
-      sendRes = await this.server.sendTransaction(preparedTx);
-    } catch (transportErr: any) {
-      transportErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
-      transportErr.effectiveFeeStroops = totalEffectiveFee + definitiveEnvelopeFee;
-      throw transportErr;
-    }
-
-    if (sendRes.status === "ERROR") {
-      const err: any = new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
-      err.committedFeeStroops = totalCommittedFee;
-      err.effectiveFeeStroops = totalEffectiveFee;
-      throw err;
-    }
-
     let txConfirmedResult: { effectiveFeeCharged: bigint; returnValue?: xdr.ScVal };
+    let sendRes: rpc.Api.SendTransactionResponse;
+    let definitiveEnvelopeFee = 0n;
+
     try {
-      txConfirmedResult = await this.waitForConfirmation(sendRes.hash);
-      totalCommittedFee += definitiveEnvelopeFee;
-      totalEffectiveFee += txConfirmedResult.effectiveFeeCharged;
-    } catch (err: any) {
-      err.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
-      err.effectiveFeeStroops = totalEffectiveFee + definitiveEnvelopeFee;
-      throw err;
+      // 3. Strict definitive envelope budget check & per-tx fee policy on invocation:
+      definitiveEnvelopeFee = BigInt(preparedTx.fee);
+      if (definitiveEnvelopeFee > maxFeeLimit) {
+        throw new Error(
+          `Envelope fee exceeds maximum allowable per-transaction policy: fee ${definitiveEnvelopeFee} > maxFeeLimit ${maxFeeLimit}`
+        );
+      }
+
+      // STRICT PRE-FLIGHT CYCLE BUDGET: Verify total combined fee (restoration + invocation) fits remainingBudget
+      if (remainingBudget !== undefined && totalCommittedFee + definitiveEnvelopeFee > remainingBudget) {
+        throw new Error(
+          `Total combined claim fee exceeds remaining cycle budget: combined ${totalCommittedFee + definitiveEnvelopeFee} > remaining ${remainingBudget}`
+        );
+      }
+
+      const preSendSolvency = await this.checkSponsorSolvency();
+      if (preSendSolvency.availableStroops < definitiveEnvelopeFee + this.config.minSponsorReserveStroops) {
+        throw new Error(
+          `Insufficient sponsor balance for assembled invocation: available ${preSendSolvency.availableStroops} < required ${definitiveEnvelopeFee + this.config.minSponsorReserveStroops} (fee: ${definitiveEnvelopeFee}, reserve: ${this.config.minSponsorReserveStroops})`
+        );
+      }
+
+      preparedTx.sign(this.sponsorKey);
+      try {
+        sendRes = await this.server.sendTransaction(preparedTx);
+      } catch (transportErr: any) {
+        transportErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
+        transportErr.effectiveFeeStroops = totalEffectiveFee + definitiveEnvelopeFee;
+        throw transportErr;
+      }
+
+      if (sendRes.status === "ERROR") {
+        throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
+      }
+
+      try {
+        txConfirmedResult = await this.waitForConfirmation(sendRes.hash);
+        totalCommittedFee += definitiveEnvelopeFee;
+        totalEffectiveFee += txConfirmedResult.effectiveFeeCharged;
+      } catch (confirmErr: any) {
+        confirmErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
+        confirmErr.effectiveFeeStroops = totalEffectiveFee + ((confirmErr && typeof confirmErr.effectiveFeeCharged === "bigint") ? confirmErr.effectiveFeeCharged : definitiveEnvelopeFee);
+        throw confirmErr;
+      }
+    } catch (postRestoreFlowErr: any) {
+      if (postRestoreFlowErr.committedFeeStroops === undefined) {
+        postRestoreFlowErr.committedFeeStroops = totalCommittedFee;
+      }
+      if (postRestoreFlowErr.effectiveFeeStroops === undefined) {
+        postRestoreFlowErr.effectiveFeeStroops = totalEffectiveFee;
+      }
+      throw postRestoreFlowErr;
     }
 
     const confirmedPayout = this.parseScValAmount(txConfirmedResult.returnValue);
@@ -675,7 +697,17 @@ export class KallpaKeeperDaemon {
           };
         }
         if (res.status === "FAILED") {
-          throw new Error(`Transaction ${txHash} execution failed on-chain`);
+          let feeCharged = 0n;
+          if (res.resultXdr) {
+            try {
+              feeCharged = res.resultXdr.feeCharged().toBigInt();
+            } catch (e) {
+              feeCharged = BigInt(res.resultXdr.feeCharged().toString());
+            }
+          }
+          const failedErr: any = new Error(`Transaction ${txHash} execution failed on-chain`);
+          failedErr.effectiveFeeCharged = feeCharged;
+          throw failedErr;
         }
       } catch (e: any) {
         clearTimeout(timerId);

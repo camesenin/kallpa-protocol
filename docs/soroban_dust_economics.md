@@ -50,11 +50,12 @@ To eliminate user friction, the **Autonomous Keeper Daemon** (`@kallpa/keeper`) 
 3. **Dual Accounting (Maximum Envelope Commitment vs Exact On-Chain Fee Charged):**
    - **Pre-Flight Ceiling Reservation:** Before submitting any envelope (restoration or invocation), the daemon computes the definitive envelope maximum fee (`tx.fee`) and validates that:
      $$\text{totalCommittedFee} + \text{definitiveEnvelopeFee} \le \text{remainingBudget}$$
-   - **Post-Confirmation Reconciliation:** Once `getTransaction` confirms `SUCCESS`, the daemon parses `resultXdr.feeCharged()` from the confirmed transaction result XDR and records the exact effective fee charged, as well as the exact confirmed return value.
-   - **Restoration Fee Retention on Downstream Failures:** If a restoration transaction is confirmed on-chain but subsequent re-simulation or invocation encounters an error, the committed fee is strictly preserved on the error object (`err.committedFeeStroops`), ensuring that cumulative cycle budgets are never breached under any error path.
+   - **Post-Confirmation Reconciliation:** Once `getTransaction` confirms `SUCCESS` or `FAILED`, the daemon parses `resultXdr.feeCharged()` from the transaction result XDR and records the exact effective fee charged, preventing fee leakage on both successful and reverted on-chain transactions.
+   - **Hermetic Restoration Commitment Protection:** If a restoration transaction is confirmed on-chain, all downstream checks (including post-restoration sequence re-fetching, re-simulation, envelope assembly, pre-flight remaining budget verification, and post-restoration `checkSponsorSolvency()`) are wrapped in a hermetic error boundary that unconditionally carries `err.committedFeeStroops = totalCommittedFee` and `err.effectiveFeeStroops = totalEffectiveFee`. This guarantees that committed restoration fees are never leaked if downstream RPC or network failures occur.
 4. **Intelligent Subsidization & Cursor Progression:**
-   - Bounded zero-payout subsidization (`maxZeroPayoutTranchesPerCycle`, default 100) prevents unmonetized drain of sponsor reserves.
-   - The keeper never terminates or skips an entire sweep when the zero-payout threshold is reached: it evaluates each subsequent investor's simulated payout individually and dispatches positive payouts immediately without blocking.
+   - **Tranche-Level Subsidy Bounding:** Subsidization is bounded at the individual tranche level (`maxZeroPayoutTranchesPerCycle`, default 100), accurately tracking the exact number of tranches advanced per batch rather than crude transaction counts.
+   - **Ternary Claim Classification (`Positive | Zero | Unknown`):** The daemon evaluates claim payouts via `isClaimZeroPayout` returning a strict ternary `ClaimPayoutType`. If simulation fails or encounters an RPC transport error, the claim is classified as `Unknown` rather than optimistically presumed `Positive`. When the zero-payout subsidy budget is exhausted, `Zero` and `Unknown` claims are safely deferred without sponsoring unverified transactions.
+   - **Non-Blocking Sweep Progression:** The keeper never terminates or stalls an entire sweep when the zero-payout threshold is reached: it evaluates each subsequent investor individually, instantly dispatching positive payouts without blocking or griefing the cycle.
 
 ---
 

@@ -1,5 +1,4 @@
-import { describe, it, expect } from "bun:test";
-import { KallpaKeeperDaemon, type KeeperConfig } from "./index";
+import { KallpaKeeperDaemon, ClaimPayoutType, type KeeperConfig } from "./index";
 import { Keypair, xdr, Address, SorobanDataBuilder } from "@stellar/stellar-sdk";
 
 describe("@kallpa/keeper", () => {
@@ -61,106 +60,117 @@ describe("@kallpa/keeper", () => {
     (daemon as any).server = {
       getAccount: async () => mockAccount,
       simulateTransaction: async () => ({
-        result: {
-          retval: exhaustedStatusVal,
-          auth: [],
-        },
+        result: { retval: exhaustedStatusVal },
       }),
-      sendTransaction: async () => {
-        throw new Error("sendTransaction must NOT be called on exhausted claim!");
-      },
     };
 
-    const realContract = new Contract(dummyConfig.poolContractIds[0]);
-    const investor = Keypair.random().publicKey();
+    const dummyPool = new Contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4");
+    const dummyInvestorVal = new Address(dummyKey.publicKey()).toScVal();
 
-    const isExhausted = await daemon.isSecondaryClaimExhausted(
-      realContract,
-      new Address(investor).toScVal()
-    );
+    const isExhausted = await daemon.isSecondaryClaimExhausted(dummyPool, dummyInvestorVal);
     expect(isExhausted).toBe(true);
 
-    const result = await daemon.disburseSecondaryRecovery(
-      realContract,
-      investor,
-      25
-    );
-    expect(result).toBeNull();
+    // executePermissionlessCall must short-circuit without network submission
+    let sendTxCalled = false;
+    (daemon as any).server.sendTransaction = async () => {
+      sendTxCalled = true;
+      return { status: "SUCCESS", hash: "mockHash" };
+    };
+
+    const receipt = await daemon.disburseSecondaryRecoveryWithReceipt(dummyPool, dummyKey.publicKey(), 10);
+    expect(receipt.txHash).toBeNull();
+    expect(receipt.feeSpentStroops).toBe(0n);
+    expect(receipt.committedFeeStroops).toBe(0n);
+    expect(receipt.effectiveFeeStroops).toBe(0n);
+    expect(sendTxCalled).toBe(false);
   });
 
   it("does NOT short-circuit when secondary recovery has unvisited tranches (total > claimed) even if payout is zero", async () => {
     const daemon = new KallpaKeeperDaemon(dummyConfig);
 
-    const { Contract } = await import("@stellar/stellar-sdk");
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
 
-    // Mock get_secondary_claim_status returning tuple (26, 25) -> 1 tranche pending!
-    const pendingStatusVal = xdr.ScVal.scvVec([
-      xdr.ScVal.scvU32(26),
+    // Mock get_secondary_claim_status returning (25, 10) -> 15 unvisited tranches!
+    const activeStatusVal = xdr.ScVal.scvVec([
       xdr.ScVal.scvU32(25),
+      xdr.ScVal.scvU32(10),
     ]);
 
+    let sentTx = false;
     (daemon as any).server = {
-      getAccount: async () => ({
-        sequenceNumber: () => "100",
-        incrementSequenceNumber: () => {},
-      }),
+      getAccount: async () => mockAccount,
       simulateTransaction: async () => ({
-        result: {
-          retval: pendingStatusVal,
-          auth: [],
+        minResourceFee: "1000",
+        results: [{ auth: [], xdr: null }],
+        transactionData: new SorobanDataBuilder().build(),
+        result: { retval: activeStatusVal },
+      }),
+      sendTransaction: async () => {
+        sentTx = true;
+        return { status: "SUCCESS", hash: "txHashProgress" };
+      },
+      getTransaction: async () => ({
+        status: "SUCCESS",
+        resultXdr: {
+          feeCharged: () => ({ toBigInt: () => 101000n, toString: () => "101000" }),
         },
       }),
     };
 
-    const realContract = new Contract(dummyConfig.poolContractIds[0]);
-    const investor = Keypair.random().publicKey();
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
 
-    const isExhausted = await daemon.isSecondaryClaimExhausted(
-      realContract,
-      new Address(investor).toScVal()
-    );
-    // Must NOT be exhausted: cursor must advance!
-    expect(isExhausted).toBe(false);
+    const dummyPool = new Contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4");
+    const receipt = await daemon.disburseSecondaryRecoveryWithReceipt(dummyPool, dummyKey.publicKey(), 10);
+
+    // Transaction MUST have been submitted to advance the cursor!
+    expect(sentTx).toBe(true);
+    expect(receipt.txHash).toBe("txHashProgress");
   });
 
   it("enforces maxFeePerTxStroops policy: rejects envelopes exceeding per-tx budget", async () => {
-    const tightConfig: KeeperConfig = {
+    const daemon = new KallpaKeeperDaemon({
       ...dummyConfig,
-      maxFeePerTxStroops: 50_000n, // Strict 0.005 XLM limit (below base inclusion 100_000)
-    };
-    const daemon = new KallpaKeeperDaemon(tightConfig);
+      maxFeePerTxStroops: 500_000n, // 0.05 XLM cap
+    });
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
     const { Account, Contract } = await import("@stellar/stellar-sdk");
     const mockAccount = new Account(dummyKey.publicKey(), "100");
 
     (daemon as any).server = {
       getAccount: async () => mockAccount,
       simulateTransaction: async () => ({
-        minResourceFee: "0",
-        results: [
-          {
-            auth: [],
-            xdr: null,
-          },
-        ],
-        transactionData: new SorobanDataBuilder().build(),
+        minResourceFee: "600000", // Requires 600k fee, exceeding 500k cap!
+        results: [{ auth: [], xdr: null }],
+        transactionData: new SorobanDataBuilder().setResourceFee(600000).build(),
       }),
     };
 
-    const realContract = new Contract(dummyConfig.poolContractIds[0]);
+    const dummyPool = new Contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4");
     expect(
-      daemon.disburseClaimReturn(realContract, Keypair.random().publicKey())
+      daemon.disburseClaimReturnWithReceipt(dummyPool, dummyKey.publicKey())
     ).rejects.toThrow("Envelope fee exceeds maximum allowable per-transaction policy");
   });
 
   it("strictly enforces that next transaction does not exceed remaining sweep budget (e.g. 300k budget with 200k tx stops at 1 tx)", async () => {
-    const tightSweepConfig: KeeperConfig = {
+    const tightConfig: KeeperConfig = {
       ...dummyConfig,
-      maxSweepBudgetStroops: 300_000n, // Budget: 300k
+      maxSweepBudgetStroops: 300_000n, // Strict 300k budget
+      maxFeePerTxStroops: 250_000n,
     };
-    const daemon = new KallpaKeeperDaemon(tightSweepConfig);
-    const poolId = tightSweepConfig.poolContractIds[0];
+    const daemon = new KallpaKeeperDaemon(tightConfig);
+    const poolId = tightConfig.poolContractIds[0];
 
-    // Mock solvency
     daemon.checkSponsorSolvency = async () => ({
       solvent: true,
       balanceStroops: 100_000_000n,
@@ -178,7 +188,7 @@ describe("@kallpa/keeper", () => {
         throw new Error(`Total combined claim fee exceeds remaining cycle budget: combined ${fee} > remaining ${remainingBudget}`);
       }
       callCount++;
-      return { txHash: "mockHash" + callCount, feeSpentStroops: fee, payoutStroops: 1000n };
+      return { txHash: "mockHash" + callCount, feeSpentStroops: fee, committedFeeStroops: fee, effectiveFeeStroops: fee, payoutStroops: 1000n };
     };
 
     const targets = new Map([
@@ -232,8 +242,8 @@ describe("@kallpa/keeper", () => {
       [
         poolId,
         [
-          { investor: Keypair.random().publicKey(), action: "claim_secondary" as const },
-          { investor: Keypair.random().publicKey(), action: "claim_secondary" as const },
+          { investor: Keypair.random().publicKey(), action: "claim_secondary" as const, maxTranches: 1 },
+          { investor: Keypair.random().publicKey(), action: "claim_secondary" as const, maxTranches: 1 },
         ],
       ],
     ]);
@@ -291,7 +301,7 @@ describe("@kallpa/keeper", () => {
 
     // Override waitForConfirmation to simulate successful restore, but then make re-simulation fail!
     let firstConfirmation = true;
-    (daemon as any).waitForConfirmation = async (hash: string) => {
+    (daemon as any).waitForConfirmation = async (_hash: string) => {
       if (firstConfirmation) {
         firstConfirmation = false;
         return { effectiveFeeCharged: 100000n };
@@ -332,7 +342,7 @@ describe("@kallpa/keeper", () => {
   it("evaluates next claim after reaching maxZeroPayouts and processes positive payout without blocking", async () => {
     const daemon = new KallpaKeeperDaemon({
       ...dummyConfig,
-      maxZeroPayoutTranchesPerCycle: 1, // Only 1 zero payout allowed
+      maxZeroPayoutTranchesPerCycle: 1, // Only 1 zero payout tranche allowed
     });
     const poolId = dummyConfig.poolContractIds[0];
 
@@ -349,9 +359,8 @@ describe("@kallpa/keeper", () => {
 
     // Investor 1 is simulated with 0 payout; Investor 2 is simulated with positive 5000 payout
     (daemon as any).isClaimZeroPayout = async (_contract: any, _method: string, args: any[]) => {
-      // If investor is investor1, returns true (zero payout). If investor2, returns false (positive payout!)
       const invAddr = Address.fromScVal(args[0]).toString();
-      return invAddr === investor1;
+      return invAddr === investor1 ? ClaimPayoutType.Zero : ClaimPayoutType.Positive;
     };
 
     let processedInvestors: string[] = [];
@@ -376,9 +385,9 @@ describe("@kallpa/keeper", () => {
       [
         poolId,
         [
-          { investor: investor1, action: "claim_secondary" as const }, // zero payout -> reaches maxZeroPayouts limit of 1
-          { investor: investor1, action: "claim_secondary" as const }, // zero payout -> MUST be skipped
-          { investor: investor2, action: "claim_secondary" as const }, // positive payout -> MUST NOT be blocked!
+          { investor: investor1, action: "claim_secondary" as const, maxTranches: 1 }, // zero payout -> reaches maxZeroPayouts limit of 1 tranche
+          { investor: investor1, action: "claim_secondary" as const, maxTranches: 1 }, // zero payout -> MUST be skipped
+          { investor: investor2, action: "claim_secondary" as const, maxTranches: 1 }, // positive payout -> MUST NOT be blocked!
         ],
       ],
     ]);
@@ -430,5 +439,153 @@ describe("@kallpa/keeper", () => {
     expect(receipt.effectiveFeeStroops).toBe(123456n);
     // Confirmed on-chain payout was 5,000 stroops (reconciled over simulation)
     expect(receipt.payoutStroops).toBe(5000n);
+  });
+
+  it("regression: post-restoration checkSponsorSolvency failure preserves committed restoration fee and prevents budget breach", async () => {
+    const tightConfig: KeeperConfig = {
+      ...dummyConfig,
+      maxSweepBudgetStroops: 300_000n, // Strict 300k cycle budget
+    };
+    const daemon = new KallpaKeeperDaemon(tightConfig);
+    const poolId = tightConfig.poolContractIds[0];
+
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    let restoreSent = false;
+    (daemon as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => ({
+        minResourceFee: "50000",
+        results: [{ auth: [], xdr: null }],
+        transactionData: new SorobanDataBuilder().build(),
+        restorePreamble: {
+          minResourceFee: "100000", // 100k restoration fee
+          transactionData: new SorobanDataBuilder().build(),
+        },
+      }),
+      sendTransaction: async () => {
+        restoreSent = true;
+        return { status: "SUCCESS", hash: "restoreTxSolvencyLeakHash" };
+      },
+      getTransaction: async () => ({
+        status: "SUCCESS",
+        resultXdr: {
+          feeCharged: () => ({ toBigInt: () => 100000n, toString: () => "100000" }),
+        },
+      }),
+    };
+
+    // Restoration succeeds and is confirmed on-chain for 100k fee (200k envelope committed)
+    (daemon as any).waitForConfirmation = async () => ({ effectiveFeeCharged: 100000n });
+
+    // Mock checkSponsorSolvency: succeeds for pre-restoration, then THROWS during post-restoration check!
+    let solvencyCalls = 0;
+    daemon.checkSponsorSolvency = async () => {
+      solvencyCalls++;
+      if (solvencyCalls >= 2) {
+        throw new Error("Simulated RPC transport network outage during post-restoration checkSponsorSolvency");
+      }
+      return {
+        solvent: true,
+        balanceStroops: 100_000_000n,
+        availableStroops: 80_000_000n,
+      };
+    };
+
+    const realContract = new Contract(poolId);
+    let capturedErr: any = null;
+    try {
+      await (daemon as any).executePermissionlessCall(
+        realContract,
+        "claim_return",
+        [new Address(Keypair.random().publicKey()).toScVal()],
+        300000n
+      );
+    } catch (err: any) {
+      capturedErr = err;
+    }
+
+    expect(restoreSent).toBe(true);
+    expect(capturedErr).toBeDefined();
+    // Critical: error must carry totalCommittedFee (200k) and totalEffectiveFee (100k)
+    expect(capturedErr.committedFeeStroops).toBe(200000n);
+    expect(capturedErr.effectiveFeeStroops).toBe(100000n);
+  });
+
+  it("regression: ternary ClaimPayoutType.Unknown skips claim when zero-payout budget exhausted", async () => {
+    const daemon = new KallpaKeeperDaemon({
+      ...dummyConfig,
+      maxZeroPayoutTranchesPerCycle: 1, // Max 1 zero payout allowed
+    });
+    const poolId = dummyConfig.poolContractIds[0];
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+    daemon.isSecondaryClaimExhausted = async () => false;
+
+    const investor1 = Keypair.random().publicKey();
+    const investorUnknown = Keypair.random().publicKey();
+
+    (daemon as any).isClaimZeroPayout = async (_c: any, _m: string, args: any[]) => {
+      const invAddr = Address.fromScVal(args[0]).toString();
+      if (invAddr === investor1) return ClaimPayoutType.Zero;
+      // Simulation fails / errors for investorUnknown -> Unknown!
+      return ClaimPayoutType.Unknown;
+    };
+
+    let processedCount = 0;
+    (daemon as any).disburseSecondaryRecoveryWithReceipt = async () => {
+      processedCount++;
+      return {
+        txHash: "mockHash",
+        committedFeeStroops: 100000n,
+        effectiveFeeStroops: 80000n,
+        feeSpentStroops: 80000n,
+        payoutStroops: 0n,
+      };
+    };
+
+    const targets = new Map([
+      [
+        poolId,
+        [
+          { investor: investor1, action: "claim_secondary" as const, maxTranches: 1 }, // Reaches max 1 zero payout
+          { investor: investorUnknown, action: "claim_secondary" as const, maxTranches: 1 }, // Unknown MUST be skipped!
+        ],
+      ],
+    ]);
+
+    const result = await daemon.runSweepCycle(targets);
+    // Only investor1 processed; investorUnknown was safely skipped due to Unknown status
+    expect(result.processed).toBe(1);
+    expect(processedCount).toBe(1);
+  });
+
+  it("regression: waitForConfirmation attaches effectiveFeeCharged from resultXdr on FAILED transaction", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+
+    (daemon as any).server = {
+      getTransaction: async () => ({
+        status: "FAILED",
+        resultXdr: {
+          feeCharged: () => ({ toBigInt: () => 145000n, toString: () => "145000" }),
+        },
+      }),
+    };
+
+    let failedErr: any = null;
+    try {
+      await (daemon as any).waitForConfirmation("failedTxHash123");
+    } catch (e: any) {
+      failedErr = e;
+    }
+
+    expect(failedErr).toBeDefined();
+    expect(failedErr.message).toContain("execution failed on-chain");
+    expect(failedErr.effectiveFeeCharged).toBe(145000n);
   });
 });
