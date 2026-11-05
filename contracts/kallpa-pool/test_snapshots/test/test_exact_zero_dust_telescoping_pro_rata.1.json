@@ -668,6 +668,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "claimed_tranches"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "cum_after"
                     },
                     "val": {
@@ -693,14 +701,6 @@
                   {
                     "key": {
                       "symbol": "principal"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "secondary_claimed"
                     },
                     "val": {
                       "i128": "0"
@@ -744,6 +744,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "claimed_tranches"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "cum_after"
                     },
                     "val": {
@@ -769,14 +777,6 @@
                   {
                     "key": {
                       "symbol": "principal"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "secondary_claimed"
                     },
                     "val": {
                       "i128": "0"
@@ -820,6 +820,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "claimed_tranches"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "cum_after"
                     },
                     "val": {
@@ -845,14 +853,6 @@
                   {
                     "key": {
                       "symbol": "principal"
-                    },
-                    "val": {
-                      "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "secondary_claimed"
                     },
                     "val": {
                       "i128": "0"

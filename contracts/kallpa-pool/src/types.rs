@@ -56,7 +56,7 @@ pub struct Position {
     pub cum_prior: i128,
     pub cum_after: i128,
     pub claimed: bool,
-    pub secondary_claimed: i128,
+    pub claimed_tranches: u32,
 }
 
 #[contracttype]
@@ -68,5 +68,6 @@ pub enum DataKey {
     TotalRepaid,
     Position(Address),
     InvestorList,
-    SecondaryRecovery,
+    SecondaryTrancheCount,
+    SecondaryTranche(u32),
 }

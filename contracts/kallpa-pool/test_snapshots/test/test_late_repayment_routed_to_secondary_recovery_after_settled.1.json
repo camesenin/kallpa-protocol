@@ -707,6 +707,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "claimed_tranches"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "cum_after"
                     },
                     "val": {
@@ -735,14 +743,6 @@
                     },
                     "val": {
                       "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "secondary_claimed"
-                    },
-                    "val": {
-                      "i128": "6000000000"
                     }
                   }
                 ]
@@ -783,6 +783,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "claimed_tranches"
+                    },
+                    "val": {
+                      "u32": 1
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "cum_after"
                     },
                     "val": {
@@ -811,14 +819,6 @@
                     },
                     "val": {
                       "i128": "0"
-                    }
-                  },
-                  {
-                    "key": {
-                      "symbol": "secondary_claimed"
-                    },
-                    "val": {
-                      "i128": "4000000000"
                     }
                   }
                 ]
@@ -933,12 +933,27 @@
                       "key": {
                         "vec": [
                           {
-                            "symbol": "SecondaryRecovery"
+                            "symbol": "SecondaryTranche"
+                          },
+                          {
+                            "u32": 1
                           }
                         ]
                       },
                       "val": {
                         "i128": "10000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "SecondaryTrancheCount"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "u32": 1
                       }
                     },
                     {

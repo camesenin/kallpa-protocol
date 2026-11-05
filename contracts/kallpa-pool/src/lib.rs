@@ -23,6 +23,21 @@ pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
+    fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SecondaryTrancheCount)
+            .unwrap_or(0);
+        let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+        env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+        env.storage().instance().set(&DataKey::SecondaryTranche(new_count), &amount);
+        Ok(())
+    }
+
     /// Initialize the milestone pool with immutable parameters.
     pub fn initialize(
         env: Env,
@@ -142,7 +157,7 @@ impl KallpaPoolContract {
             cum_prior,
             cum_after: new_total,
             claimed: false,
-            secondary_claimed: 0,
+            claimed_tranches: 0,
         };
 
         env.storage().persistent().set(&position_key, &position);
@@ -195,20 +210,10 @@ impl KallpaPoolContract {
         let token_client = token::Client::new(&env, &config.asset);
 
         // If pool is already Settled or Disputed, any post-settlement repayment or late recovery
-        // accumulates safely into SecondaryRecovery without altering frozen primary R.
+        // routes to a discrete immutable secondary tranche without altering frozen primary R.
         if state == PoolState::Settled || state == PoolState::Disputed {
             token_client.transfer(&payer, &env.current_contract_address(), &amount);
-
-            let sec_rec: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryRecovery)
-                .unwrap_or(0);
-            let new_sec = sec_rec.checked_add(amount).ok_or(Error::MathOverflow)?;
-            if new_sec > MAX_MONETARY_CAP {
-                return Err(Error::CapacityExceeded);
-            }
-            env.storage().instance().set(&DataKey::SecondaryRecovery, &new_sec);
+            Self::record_secondary_tranche(&env, amount)?;
             env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
             return Ok(());
         }
@@ -232,7 +237,7 @@ impl KallpaPoolContract {
             return Err(Error::CapacityExceeded);
         }
 
-        // Cap primary allocation at repayment_target; any surplus automatically buffers into SecondaryRecovery
+        // Cap primary allocation strictly at repayment_target; any surplus routes to a discrete secondary tranche
         let (primary_part, secondary_part) = if amount > remaining_obligation {
             (remaining_obligation, amount.checked_sub(remaining_obligation).ok_or(Error::MathOverflow)?)
         } else {
@@ -245,16 +250,7 @@ impl KallpaPoolContract {
         env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
 
         if secondary_part > 0 {
-            let sec_rec: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryRecovery)
-                .unwrap_or(0);
-            let new_sec = sec_rec.checked_add(secondary_part).ok_or(Error::MathOverflow)?;
-            if new_sec > MAX_MONETARY_CAP {
-                return Err(Error::CapacityExceeded);
-            }
-            env.storage().instance().set(&DataKey::SecondaryRecovery, &new_sec);
+            Self::record_secondary_tranche(&env, secondary_part)?;
         }
 
         // Once the full agreed obligation (principal + yield) is reached, pool moves to Settled
@@ -343,21 +339,28 @@ impl KallpaPoolContract {
                 .get(&DataKey::TotalRepaid)
                 .unwrap_or(0);
 
-            let new_repaid = total_repaid.checked_add(amount).ok_or(Error::MathOverflow)?;
+            let remaining_obligation = config
+                .repayment_target
+                .checked_sub(total_repaid)
+                .ok_or(Error::MathOverflow)?;
+
+            // Strictly cap primary TotalRepaid at repayment_target; route surplus to secondary tranche
+            let (primary_part, secondary_part) = if amount > remaining_obligation {
+                (remaining_obligation, amount.checked_sub(remaining_obligation).ok_or(Error::MathOverflow)?)
+            } else {
+                (amount, 0i128)
+            };
+
+            let new_repaid = total_repaid.checked_add(primary_part).ok_or(Error::MathOverflow)?;
             env.storage().instance().set(&DataKey::TotalRepaid, &new_repaid);
             env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
-        } else {
-            // Already Settled or Disputed: late dispute refund accumulates safely into SecondaryRecovery
-            let sec_rec: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryRecovery)
-                .unwrap_or(0);
-            let new_sec = sec_rec.checked_add(amount).ok_or(Error::MathOverflow)?;
-            if new_sec > MAX_MONETARY_CAP {
-                return Err(Error::CapacityExceeded);
+
+            if secondary_part > 0 {
+                Self::record_secondary_tranche(&env, secondary_part)?;
             }
-            env.storage().instance().set(&DataKey::SecondaryRecovery, &new_sec);
+        } else {
+            // Already Settled or Disputed: late dispute refund routes to discrete secondary tranche
+            Self::record_secondary_tranche(&env, amount)?;
         }
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -514,6 +517,11 @@ impl KallpaPoolContract {
     /// Participant claims their exact pro-rata entitlement of late/secondary recoveries
     /// arriving after the pool has entered Settled or Disputed state.
     /// Can be called multiple times as new recovery tranches arrive.
+    /// Participant claims their exact pro-rata entitlement of late/secondary recoveries
+    /// arriving after the pool has entered Settled or Disputed state.
+    /// Evaluates each discrete immutable secondary tranche independently:
+    /// Payout_{i,k} = floor(cum_after_i * S_k / T) - floor(cum_prior_i * S_k / T)
+    /// Guarantees strict monotonicity, order-independence, and zero-dust exact conservation.
     pub fn claim_secondary_recovery(env: Env, investor: Address) -> Result<i128, Error> {
         investor.require_auth();
 
@@ -546,41 +554,46 @@ impl KallpaPoolContract {
             .get(&DataKey::TotalCollected)
             .unwrap_or(0);
 
-        let secondary_total: i128 = env
+        let total_tranches: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::SecondaryRecovery)
+            .get(&DataKey::SecondaryTrancheCount)
             .unwrap_or(0);
 
-        if total_collected <= 0 || secondary_total <= 0 {
+        if total_collected <= 0 || total_tranches <= position.claimed_tranches {
             return Ok(0);
         }
 
-        // Telescoping cumulative formula over secondary recovery buffer
-        let upper = position
-            .cum_after
-            .checked_mul(secondary_total)
-            .ok_or(Error::MathOverflow)?
-            .checked_div(total_collected)
-            .ok_or(Error::MathOverflow)?;
+        let mut total_payout: i128 = 0;
+        let start = position.claimed_tranches + 1;
+        for tranche_idx in start..=total_tranches {
+            let tranche_amount: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTranche(tranche_idx))
+                .unwrap_or(0);
 
-        let lower = position
-            .cum_prior
-            .checked_mul(secondary_total)
-            .ok_or(Error::MathOverflow)?
-            .checked_div(total_collected)
-            .ok_or(Error::MathOverflow)?;
+            if tranche_amount > 0 {
+                let upper = position
+                    .cum_after
+                    .checked_mul(tranche_amount)
+                    .ok_or(Error::MathOverflow)?
+                    .checked_div(total_collected)
+                    .ok_or(Error::MathOverflow)?;
 
-        let cumulative_entitlement = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
-        let claimable = cumulative_entitlement
-            .checked_sub(position.secondary_claimed)
-            .ok_or(Error::MathOverflow)?;
+                let lower = position
+                    .cum_prior
+                    .checked_mul(tranche_amount)
+                    .ok_or(Error::MathOverflow)?
+                    .checked_div(total_collected)
+                    .ok_or(Error::MathOverflow)?;
 
-        if claimable <= 0 {
-            return Ok(0);
+                let payout = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
+                total_payout = total_payout.checked_add(payout).ok_or(Error::MathOverflow)?;
+            }
         }
 
-        position.secondary_claimed = cumulative_entitlement;
+        position.claimed_tranches = total_tranches;
         env.storage().persistent().set(&position_key, &position);
         env.storage().persistent().extend_ttl(
             &position_key,
@@ -588,11 +601,13 @@ impl KallpaPoolContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        let token_client = token::Client::new(&env, &config.asset);
-        token_client.transfer(&env.current_contract_address(), &investor, &claimable);
+        if total_payout > 0 {
+            let token_client = token::Client::new(&env, &config.asset);
+            token_client.transfer(&env.current_contract_address(), &investor, &total_payout);
+        }
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        Ok(claimable)
+        Ok(total_payout)
     }
 
     /// Read current pool configuration and status.
