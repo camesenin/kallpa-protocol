@@ -1223,6 +1223,30 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "TotalClaimedPrimary"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "50000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalClaimedSecondary"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "50000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "TotalCollected"
                           }
                         ]
@@ -1236,6 +1260,18 @@
                         "vec": [
                           {
                             "symbol": "TotalRepaid"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "50000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalSecondaryAllocated"
                           }
                         ]
                       },

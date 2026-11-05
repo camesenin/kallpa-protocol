@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | **Stellar Testnet** | CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX | [Stellar.Expert](https://stellar.expert/explorer/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) · [Stellar Lab](https://lab.stellar.org/r/testnet/contract/CCK7PKTBIYGQ5KXBO6V7DCR5CT45RNOZHO6HM2WHKOTT2HLC4WQHEGDX) |
 | **Deployer** | GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E | [Stellar.Expert](https://stellar.expert/explorer/testnet/account/GCA3QFC6263BVQTHUTYAL6IRXQCNT2QGCYXHMCFPMCQONQKCU4QNGX2E) |
-| **WASM Hash** | 6b78f7c7ca6840b68ec55624a62c7b01370323f03971a1d96a74000f83dcfd9e (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 23 / Soroban v28 |
+| **WASM Hash** | 5c7096f3739ca0b8532f3aca2a44c6cbda293162134adb8a434eec943bbdea68 (Local v0.1.0 release) / c0dd407eaeda19a16dc1e77c446f4e4e730b3cfbd718c6b057dafa114fa377de (Initial Testnet verification build) | Protocol 28 / Soroban v28 |
 
 ---
 
@@ -113,12 +113,12 @@ kallpa-protocol/
 ## 🚀 Getting Started
 
 ### Prerequisites
-- **Rust Toolchain:** `rustc 1.99.1+` with target `wasm32v1-none` (Soroban Protocol 22/23 standard)
+- **Rust Toolchain:** `rustc 1.99.1+` with target `wasm32v1-none` (Soroban Protocol 28 standard)
 - **Bun:** `v1.4+` (recommended for SDK and tests) or **Node.js:** `v20+`
 
 ### 1. Build Smart Contract WASM
 ```bash
-# Build for wasm32v1-none (Protocol 22/23 target with spec-shaking v2 enabled):
+# Build for wasm32v1-none (Protocol 28 target with spec-shaking v2 enabled):
 SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2=1 cargo build --target wasm32v1-none --release
 ```
 

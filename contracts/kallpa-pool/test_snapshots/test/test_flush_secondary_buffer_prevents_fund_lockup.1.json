@@ -1002,6 +1002,30 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "TotalClaimedPrimary"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "100000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalClaimedSecondary"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "5000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "TotalCollected"
                           }
                         ]

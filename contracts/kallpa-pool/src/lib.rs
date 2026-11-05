@@ -65,6 +65,14 @@ impl KallpaPoolContract {
         let tranche_key = DataKey::SecondaryTranche(new_count);
         env.storage().persistent().set(&tranche_key, &combined);
         env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let total_sec: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSecondaryAllocated)
+            .unwrap_or(0);
+        let new_total_sec = total_sec.checked_add(combined).ok_or(Error::MathOverflow)?;
+        env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
         Ok(())
     }
 
@@ -477,6 +485,14 @@ impl KallpaPoolContract {
         );
 
         if payout > 0 {
+            let claimed_pri: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalClaimedPrimary)
+                .unwrap_or(0);
+            let new_claimed_pri = claimed_pri.checked_add(payout).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalClaimedPrimary, &new_claimed_pri);
+
             let token_client = token::Client::new(&env, &config.asset);
             token_client.transfer(&env.current_contract_address(), &investor, &payout);
         }
@@ -652,6 +668,14 @@ impl KallpaPoolContract {
         );
 
         if total_payout > 0 {
+            let claimed_sec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalClaimedSecondary)
+                .unwrap_or(0);
+            let new_claimed_sec = claimed_sec.checked_add(total_payout).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalClaimedSecondary, &new_claimed_sec);
+
             let token_client = token::Client::new(&env, &config.asset);
             token_client.transfer(&env.current_contract_address(), &investor, &total_payout);
         }
@@ -743,39 +767,68 @@ impl KallpaPoolContract {
             return Err(Error::PoolNotFunded);
         }
 
+        let now = env.ledger().timestamp();
+        // Disputed transitions can ONLY be triggered after funding_deadline, or caller must be tw_escrow or admin
+        if state == PoolState::Funded && caller != config.tw_escrow && caller != config.admin && now <= config.funding_deadline {
+            return Err(Error::Unauthorized);
+        }
+
         let token_client = token::Client::new(&env, &config.asset);
         let actual_balance = token_client.balance(&env.current_contract_address());
 
-        let recognized: i128 = env
+        // Invariant-based unallocated surplus calculation:
+        // Contract obligations = (TotalRepaid - TotalClaimedPrimary) + (TotalSecondaryAllocated - TotalClaimedSecondary) + PendingSecondaryBuffer
+        let total_repaid: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::RecognizedBalance)
+            .get(&DataKey::TotalRepaid)
+            .unwrap_or(0);
+        let claimed_pri: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalClaimedPrimary)
+            .unwrap_or(0);
+        let active_pri_obligation = total_repaid.checked_sub(claimed_pri).ok_or(Error::MathOverflow)?;
+
+        let total_sec: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSecondaryAllocated)
+            .unwrap_or(0);
+        let claimed_sec: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalClaimedSecondary)
+            .unwrap_or(0);
+        let active_sec_obligation = total_sec.checked_sub(claimed_sec).ok_or(Error::MathOverflow)?;
+
+        let pending_buf: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSecondaryBuffer)
             .unwrap_or(0);
 
-        let surplus = actual_balance.checked_sub(recognized).ok_or(Error::MathOverflow)?;
-        if surplus <= 0 {
+        let total_allocated_held = active_pri_obligation
+            .checked_add(active_sec_obligation)
+            .ok_or(Error::MathOverflow)?
+            .checked_add(pending_buf)
+            .ok_or(Error::MathOverflow)?;
+
+        let unallocated_surplus = actual_balance.checked_sub(total_allocated_held).ok_or(Error::MathOverflow)?;
+        if unallocated_surplus <= 0 {
             return Ok(0);
         }
 
-        // Update recognized balance to match actual onchain balance
-        env.storage().instance().set(&DataKey::RecognizedBalance, &actual_balance);
-
         if state == PoolState::Funded {
-            let total_repaid: i128 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TotalRepaid)
-                .unwrap_or(0);
-
             let remaining_obligation = config
                 .repayment_target
                 .checked_sub(total_repaid)
                 .ok_or(Error::MathOverflow)?;
 
-            let (primary_part, secondary_part) = if surplus > remaining_obligation {
-                (remaining_obligation, surplus.checked_sub(remaining_obligation).ok_or(Error::MathOverflow)?)
+            let (primary_part, secondary_part) = if unallocated_surplus > remaining_obligation {
+                (remaining_obligation, unallocated_surplus.checked_sub(remaining_obligation).ok_or(Error::MathOverflow)?)
             } else {
-                (surplus, 0i128)
+                (unallocated_surplus, 0i128)
             };
 
             let new_repaid = total_repaid.checked_add(primary_part).ok_or(Error::MathOverflow)?;
@@ -786,11 +839,11 @@ impl KallpaPoolContract {
                 Self::record_secondary_tranche(&env, secondary_part)?;
             }
         } else {
-            Self::record_secondary_tranche(&env, surplus)?;
+            Self::record_secondary_tranche(&env, unallocated_surplus)?;
         }
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        Ok(surplus)
+        Ok(unallocated_surplus)
     }
 
 pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Error> {

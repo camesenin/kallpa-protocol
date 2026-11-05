@@ -1037,6 +1037,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "TotalClaimedSecondary"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "10000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "TotalCollected"
                           }
                         ]
@@ -1055,6 +1067,18 @@
                       },
                       "val": {
                         "i128": "100000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalSecondaryAllocated"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "10000000"
                       }
                     }
                   ]

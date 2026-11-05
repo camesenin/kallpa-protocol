@@ -825,6 +825,18 @@
                       "key": {
                         "vec": [
                           {
+                            "symbol": "TotalClaimedPrimary"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "80000000000"
+                      }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
                             "symbol": "TotalCollected"
                           }
                         ]

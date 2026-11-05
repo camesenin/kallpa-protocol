@@ -864,13 +864,17 @@ fn test_flush_secondary_buffer_prevents_fund_lockup() {
 
 #[test]
 fn test_autonomous_balance_reconciliation_on_direct_tw_refund() {
-    // Verifies autonomous reconciliation when Trustless Work or arbiter sends funds
-    // DIRECTLY to the pool contract address (push transfer), bypassing caller withdrawal:
+    // Verifies invariant-based autonomous reconciliation when Trustless Work or arbiter sends funds
+    // DIRECTLY to the pool contract address (push transfer), with multi-stage payouts and zero double-counting:
     // 1. Contributors pool 10,000 USDC -> Released to TW Escrow
-    // 2. Dispute occurs; TW Escrow contract executes a native token transfer of 8,000 USDC directly to KallpaPool address
-    // 3. Anyone (e.g. contributor, keeper) invokes `reconcile_incoming_balance` permissionlessly
-    // 4. Contract recognizes unrecorded surplus, updates TotalRepaid to 8,000 USDC, and transitions to Disputed
-    // 5. Investors claim exact pro-rata returns with zero residual dust
+    // 2. Dispute occurs; TW Escrow contract executes a native token transfer of 7,500 USDC directly to KallpaPool address
+    // 3. Contributor invokes `reconcile_incoming_balance` post-deadline (or TW escrow invokes anytime)
+    // 4. Contract recognizes unrecorded surplus, updates TotalRepaid to 7,500 USDC, and transitions to Disputed
+    // 5. Investors claim primary pro-rata returns: 4,500 and 3,000 USDC. Balance drops to 0!
+    // 6. ADVERSARIAL TEST: Re-calling reconcile_incoming_balance produces ZERO surplus (no phantom tranches)
+    // 7. MULTI-TRANCHE TEST: Months later, an additional 1,000 USDC dispute recovery is pushed directly to KallpaPool.
+    // 8. Reconcile accurately detects exactly 1,000 USDC as unallocated surplus, creating a secondary tranche!
+    // 9. Investors claim their secondary share (600 and 400 USDC) with zero residual dust.
     let setup = setup_test();
     let target = 10_000_0000000i128; // 10,000 USDC
     let repayment_target = 10_000_0000000i128;
@@ -901,7 +905,9 @@ fn test_autonomous_balance_reconciliation_on_direct_tw_refund() {
     setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &7_500_0000000i128);
     assert_eq!(setup.token_client.balance(&setup.contract_id), 7_500_0000000i128);
 
-    // Any contributor or keeper calls reconcile_incoming_balance permissionlessly
+    // Advance past funding deadline so any participant can permissionlessly reconcile
+    setup.env.ledger().set_timestamp(funding_deadline + 10);
+
     let surplus = setup.client.reconcile_incoming_balance(&setup.investor1);
     assert_eq!(surplus, 7_500_0000000i128);
 
@@ -915,5 +921,22 @@ fn test_autonomous_balance_reconciliation_on_direct_tw_refund() {
     assert_eq!(p1, 4_500_0000000i128);
     assert_eq!(p2, 3_000_0000000i128);
     assert_eq!(p1 + p2, 7_500_0000000i128);
+    assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
+
+    // Invariant Check 1: Re-calling reconcile produces 0 surplus
+    let re_call = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(re_call, 0i128);
+
+    // Invariant Check 2: Second push of 1,000 USDC arrives later
+    setup.token_client.transfer(&setup.tw_escrow, &setup.contract_id, &1_000_0000000i128);
+    let sec_surplus = setup.client.reconcile_incoming_balance(&setup.investor2);
+    assert_eq!(sec_surplus, 1_000_0000000i128);
+
+    // Claim secondary share
+    let sec1 = setup.client.claim_secondary_recovery(&setup.investor1, &None);
+    let sec2 = setup.client.claim_secondary_recovery(&setup.investor2, &None);
+    assert_eq!(sec1, 600_0000000i128); // 60% of 1,000
+    assert_eq!(sec2, 400_0000000i128); // 40% of 1,000
+    assert_eq!(sec1 + sec2, 1_000_0000000i128);
     assert_eq!(setup.token_client.balance(&setup.contract_id), 0i128);
 }
