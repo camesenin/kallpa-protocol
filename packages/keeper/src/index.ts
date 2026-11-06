@@ -18,6 +18,8 @@ import {
   xdr,
   StrKey,
 } from "@stellar/stellar-sdk";
+import * as fs from "fs";
+import * as path from "path";
 
 export interface KeeperConfig {
   rpcUrl: string;
@@ -29,6 +31,7 @@ export interface KeeperConfig {
   maxFeePerTxStroops?: bigint; // Maximum fee willing to pay per single envelope (e.g. 2_000_000n = 0.2 XLM)
   maxSweepBudgetStroops?: bigint; // Maximum cumulative spend per single sweep cycle (e.g. 20_000_000n = 2 XLM)
   maxZeroPayoutTranchesPerCycle?: number; // Maximum zero-payout advancement tranches permitted per cycle to bound unmonetized subsidies
+  storagePath?: string; // Optional path for durable disk-backed reservation persistence
 }
 
 export interface InvestorClaimTarget {
@@ -65,11 +68,53 @@ export class KallpaKeeperDaemon {
   private config: KeeperConfig;
   private isSweepCycleActive: boolean = false;
   private pendingReservations: Map<string, PendingTxReservation> = new Map();
+  private storageFile: string | null = null;
 
   constructor(config: KeeperConfig) {
     this.config = config;
     this.server = new rpc.Server(config.rpcUrl);
     this.sponsorKey = Keypair.fromSecret(config.sponsorSecret);
+    if (config.storagePath) {
+      this.storageFile = config.storagePath;
+      this.loadDurableReservations();
+    }
+  }
+
+  private loadDurableReservations(): void {
+    if (!this.storageFile) return;
+    try {
+      if (fs.existsSync(this.storageFile)) {
+        const raw = fs.readFileSync(this.storageFile, "utf-8");
+        const list: Array<{ txHash: string; committedFeeStroops: string; timestamp: number }> = JSON.parse(raw);
+        for (const item of list) {
+          this.pendingReservations.set(item.txHash, {
+            txHash: item.txHash,
+            committedFeeStroops: BigInt(item.committedFeeStroops),
+            timestamp: item.timestamp,
+          });
+        }
+      }
+    } catch (e) {
+      // In case of corrupt file or read error, fallback to empty in-memory state
+    }
+  }
+
+  private persistDurableReservations(): void {
+    if (!this.storageFile) return;
+    try {
+      const list = Array.from(this.pendingReservations.values()).map(r => ({
+        txHash: r.txHash,
+        committedFeeStroops: r.committedFeeStroops.toString(),
+        timestamp: r.timestamp,
+      }));
+      const dir = path.dirname(this.storageFile);
+      if (dir && !fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(this.storageFile, JSON.stringify(list, null, 2), "utf-8");
+    } catch (e) {
+      // Non-fatal write warning
+    }
   }
 
   /**
@@ -168,11 +213,13 @@ export class KallpaKeeperDaemon {
    */
   public async reconcilePendingReservations(): Promise<void> {
     const now = Date.now();
+    let changed = false;
     for (const [txHash, reservation] of Array.from(this.pendingReservations.entries())) {
       try {
         const res = await this.server.getTransaction(txHash);
         if (res.status === "SUCCESS" || res.status === "FAILED") {
           this.pendingReservations.delete(txHash);
+          changed = true;
           continue;
         }
       } catch (e) {
@@ -181,7 +228,11 @@ export class KallpaKeeperDaemon {
       // Prune expired after 10m (well past 30s envelope validity timeout)
       if (now - reservation.timestamp > 600_000) {
         this.pendingReservations.delete(txHash);
+        changed = true;
       }
+    }
+    if (changed) {
+      this.persistDurableReservations();
     }
   }
 
@@ -759,12 +810,13 @@ export class KallpaKeeperDaemon {
         throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
       }
 
-      // Track pending reservation for in-flight transaction
+      // Track pending reservation for in-flight transaction and persist immediately
       this.pendingReservations.set(sendRes.hash, {
         txHash: sendRes.hash,
         committedFeeStroops: definitiveEnvelopeFee,
         timestamp: Date.now(),
       });
+      this.persistDurableReservations();
 
       try {
         txConfirmedResult = await this.waitForConfirmation(sendRes.hash);
@@ -772,10 +824,12 @@ export class KallpaKeeperDaemon {
         totalEffectiveFee += txConfirmedResult.effectiveFeeCharged;
         // Cleanly remove from pendingReservations upon confirmed execution
         this.pendingReservations.delete(sendRes.hash);
+        this.persistDurableReservations();
       } catch (confirmErr: any) {
         confirmErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
         confirmErr.effectiveFeeStroops = totalEffectiveFee + ((confirmErr && typeof confirmErr.effectiveFeeCharged === "bigint") ? confirmErr.effectiveFeeCharged : definitiveEnvelopeFee);
         // Retain in pendingReservations across timeout so subsequent cycles deduct it
+        this.persistDurableReservations();
         throw confirmErr;
       }
     } catch (postRestoreFlowErr: any) {

@@ -30,6 +30,14 @@ const MAX_TRANCHES_PER_TX: u32 = 10;
 // Minimum cooldown period (in seconds) between manual flush calls to prevent spamming micro-tranches
 const FLUSH_COOLDOWN_SECONDS: u64 = 86400; // 24 hours
 
+// Hard upper bound on total discrete secondary tranches over the entire lifetime of a pool.
+// This strictly caps the persistent storage footprint, state archival surface, and keeper claim cycles:
+// K <= MAX_SECONDARY_TRANCHES (exactly 100 tranches). Once reached, any further incoming late recovery
+// or residual flush merges directly into the 100th tranche, guaranteeing finite lifetime complexity.
+// In terms of batch claims (MAX_BATCH_CLAIM_TRANCHES = 50), any investor can claim all lifetime recoveries
+// in at most 2 batch transactions!
+pub const MAX_SECONDARY_TRANCHES: u32 = 100;
+
 #[contract]
 pub struct KallpaPoolContract;
 
@@ -57,10 +65,36 @@ impl KallpaPoolContract {
 
         // Materialize discrete tranches strictly capped at MAX_MONETARY_CAP per tranche
         // and bounded by MAX_TRANCHES_PER_TX to guarantee strict resource metering.
-        // Any surplus beyond MAX_TRANCHES_PER_TX * MAX_MONETARY_CAP remains in PendingSecondaryBuffer
-        // and can be incrementally materialized in subsequent transactions without reversion.
+        // Once SecondaryTrancheCount reaches MAX_SECONDARY_TRANCHES (50), no new discrete keys
+        // are created; all further incoming secondary funds accumulate directly into the 50th tranche.
         let mut tranches_created = 0u32;
         while combined >= MIN_RECOVERY_TRANCHE && tranches_created < MAX_TRANCHES_PER_TX {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+
+            if count >= MAX_SECONDARY_TRANCHES {
+                // Ceiling reached: merge remaining balance directly into the final terminal tranche (50)
+                let final_key = DataKey::SecondaryTranche(MAX_SECONDARY_TRANCHES);
+                let current_final: i128 = env.storage().persistent().get(&final_key).unwrap_or(0);
+                let new_final = current_final.checked_add(combined).ok_or(Error::MathOverflow)?;
+                env.storage().persistent().set(&final_key, &new_final);
+                env.storage().persistent().extend_ttl(&final_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+                let total_sec: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalSecondaryAllocated)
+                    .unwrap_or(0);
+                let new_total_sec = total_sec.checked_add(combined).ok_or(Error::MathOverflow)?;
+                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+
+                combined = 0;
+                break;
+            }
+
             let tranche_amount = if combined > MAX_MONETARY_CAP {
                 MAX_MONETARY_CAP
             } else {
@@ -70,11 +104,6 @@ impl KallpaPoolContract {
             combined = combined.checked_sub(tranche_amount).ok_or(Error::MathOverflow)?;
             tranches_created = tranches_created.saturating_add(1);
 
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryTrancheCount)
-                .unwrap_or(0);
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
             env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
             let tranche_key = DataKey::SecondaryTranche(new_count);
@@ -766,11 +795,40 @@ impl KallpaPoolContract {
 
         env.storage().instance().set(&DataKey::LastFlushTimestamp, &now);
 
-        // Bounded materialization strictly respecting MAX_MONETARY_CAP per tranche and MAX_TRANCHES_PER_TX
+        // Bounded materialization strictly respecting MAX_MONETARY_CAP per tranche and MAX_TRANCHES_PER_TX.
+        // Once SecondaryTrancheCount reaches MAX_SECONDARY_TRANCHES (50), no new discrete keys
+        // are created; all further flushed balance merges directly into the 50th terminal tranche.
         let mut total_flushed: i128 = 0;
         let mut tranches_created = 0u32;
 
         while pending > 0 && tranches_created < MAX_TRANCHES_PER_TX {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+
+            if count >= MAX_SECONDARY_TRANCHES {
+                // Ceiling reached: merge remaining balance directly into the final terminal tranche (50)
+                let final_key = DataKey::SecondaryTranche(MAX_SECONDARY_TRANCHES);
+                let current_final: i128 = env.storage().persistent().get(&final_key).unwrap_or(0);
+                let new_final = current_final.checked_add(pending).ok_or(Error::MathOverflow)?;
+                env.storage().persistent().set(&final_key, &new_final);
+                env.storage().persistent().extend_ttl(&final_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+                let total_sec: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalSecondaryAllocated)
+                    .unwrap_or(0);
+                let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
+                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+
+                total_flushed = total_flushed.checked_add(pending).ok_or(Error::MathOverflow)?;
+                pending = 0;
+                break;
+            }
+
             let tranche_amount = if pending > MAX_MONETARY_CAP {
                 MAX_MONETARY_CAP
             } else {
@@ -781,11 +839,6 @@ impl KallpaPoolContract {
             total_flushed = total_flushed.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
             tranches_created = tranches_created.saturating_add(1);
 
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryTrancheCount)
-                .unwrap_or(0);
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
             env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
             let tranche_key = DataKey::SecondaryTranche(new_count);

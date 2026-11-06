@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { KallpaKeeperDaemon, ClaimPayoutType, type KeeperConfig } from "./index";
-import { Keypair, xdr, Address, SorobanDataBuilder, StrKey } from "@stellar/stellar-sdk";
+import { Keypair, xdr, Address, SorobanDataBuilder, StrKey, Contract } from "@stellar/stellar-sdk";
+import * as fs from "fs";
+import * as path from "path";
 
 describe("@kallpa/keeper", () => {
   const dummyKey = Keypair.random();
@@ -1040,5 +1042,90 @@ describe("@kallpa/keeper", () => {
     expect((daemon as any).pendingReservations.size).toBe(0);
     const solvencyAfter = await daemon.checkSponsorSolvency();
     expect(solvencyAfter.availableStroops).toBe(90_000_000n);
+  });
+
+  it("strictly persists pending reservations to disk and survives daemon crash/restart", async () => {
+    const tmpStoragePath = path.join(__dirname, "../../../tmp_test_reservations.json");
+    if (fs.existsSync(tmpStoragePath)) {
+      fs.unlinkSync(tmpStoragePath);
+    }
+
+    const configWithStorage: KeeperConfig = {
+      ...dummyConfig,
+      storagePath: tmpStoragePath,
+    };
+
+    const { Account } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    // 1. Instantiate Daemon 1 with disk persistence
+    const daemon1 = new KallpaKeeperDaemon(configWithStorage);
+
+    const dummyAccountEntry = {
+      balance: () => ({ toBigInt: () => 100_000_000n }),
+      numSubEntries: () => 0,
+      ext: () => ({ switch: () => 0 }),
+    };
+    (daemon1 as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => ({
+        minResourceFee: "1000",
+        results: [{ auth: [], xdr: null }],
+        result: { auth: [], retval: null },
+        transactionData: new SorobanDataBuilder().build(),
+      }),
+      getLedgerEntries: async () => ({
+        entries: [{ val: { account: () => dummyAccountEntry } }],
+      }),
+      sendTransaction: async () => ({ status: "PENDING", hash: "crashTx999" }),
+      waitForConfirmation: async () => {
+        throw new Error("RPC timeout: simulate daemon crash/unhandled rejection");
+      },
+    };
+
+    // Execute permissionless call that will time out / fail confirmation
+    try {
+      await (daemon1 as any).executePermissionlessCall(
+        new Contract("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"),
+        "claim_return",
+        [new Address("GBZTXOQL6SZPU5EFMKHN2IQLAFH54PFARM6P2NPRAWIXS4L5FDCLQUL5").toScVal()]
+      );
+    } catch (e: any) {
+      // Expected timeout/failure to trigger reservation retention
+    }
+
+    // Verify reservation was written to disk
+    expect(fs.existsSync(tmpStoragePath)).toBe(true);
+    const fileContent = fs.readFileSync(tmpStoragePath, "utf-8");
+    expect(fileContent).toContain("crashTx999");
+
+    // 2. Simulate Daemon restart: Instantiate fresh Daemon 2 with same storagePath
+    const daemon2 = new KallpaKeeperDaemon(configWithStorage);
+    (daemon2 as any).server = {
+      getLedgerEntries: async () => ({
+        entries: [{ val: { account: () => dummyAccountEntry } }],
+      }),
+      getTransaction: async (hash: string) => {
+        if (hash === "crashTx999") {
+          return { status: "SUCCESS" };
+        }
+        throw new Error("Not found");
+      },
+    };
+
+    // Daemon 2 loaded reservations from disk
+    const preSolvency = await daemon2.checkSponsorSolvency();
+    // Reservation was restored across restart!
+    expect(preSolvency.availableStroops).toBeLessThan(90_000_000n);
+
+    // Reconcile on new daemon instance
+    await daemon2.reconcilePendingReservations();
+    const postSolvency = await daemon2.checkSponsorSolvency();
+    expect(postSolvency.availableStroops).toBe(90_000_000n);
+
+    // Cleanup
+    if (fs.existsSync(tmpStoragePath)) {
+      fs.unlinkSync(tmpStoragePath);
+    }
   });
 });
