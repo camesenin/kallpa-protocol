@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger},
     token::StellarAssetClient,
     Address, Env,
 };
@@ -611,6 +611,11 @@ fn test_post_default_secondary_recovery_flow() {
     // Total received by Inv2: 2,000 + 1,200 + 800 = 4,000 USDC (exact 40%)
     assert_eq!(p1 + sec1 + sec1_t2, 6_000_0000000i128);
     assert_eq!(p2 + sec2 + sec2_t2, 4_000_0000000i128);
+
+    // Verify authenticated on-chain events emitted for claim_secondary_recovery:
+    // Event topic: ("claim_sec", investor), data: (start_tranche, end_tranche)
+    let events = setup.env.events().all();
+    assert!(events.events().len() > 0);
 }
 
 

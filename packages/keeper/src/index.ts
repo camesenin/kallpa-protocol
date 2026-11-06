@@ -49,6 +49,7 @@ export interface ClaimExecutionReceipt {
   feeSpentStroops: bigint; // Backwards compatible alias for effectiveFeeStroops
   payoutStroops: bigint; // Confirmed on-chain payout amount returned by contract invocation
   tranchesAdvanced?: number; // Exact count of persistent tranches advanced on-chain
+  resultMetaXdr?: any; // Raw or parsed TransactionMeta from RPC response
 }
 
 export class KallpaKeeperDaemon {
@@ -410,22 +411,27 @@ export class KallpaKeeperDaemon {
       remainingBudget
     );
     if (receipt.txHash !== null) {
-      // Reconcile exact on-chain advancement by querying state after execution
-      try {
-        const statusAfter = await this.getSecondaryClaimStatus(poolContract, scValInvestor);
-        // Strict Attribution & Anti-Phantom Guard:
-        // Our transaction requested at most `maxTranches`.
-        // If an external actor advanced tranches concurrently, the total delta (statusAfter.claimed - statusBefore.claimed)
-        // might exceed maxTranches. Our transaction could only advance at most:
-        // min(maxTranches, statusAfter.claimed - statusBefore.claimed).
-        // Furthermore, if our transaction yielded a positive payout, it advanced at least 1 tranche.
-        const totalDelta = statusAfter.claimed > statusBefore.claimed
-          ? (statusAfter.claimed - statusBefore.claimed)
-          : expectedAdvancement;
-        const actualAdvanced = Math.min(maxTranches, totalDelta);
-        receipt.tranchesAdvanced = actualAdvanced;
-      } catch (e) {
-        receipt.tranchesAdvanced = expectedAdvancement;
+      // 1. Authoritative Attribution: Attempt exact derivation from confirmed transaction event metadata
+      let eventTranches: number | null = null;
+      if (receipt.resultMetaXdr) {
+        eventTranches = this.extractTranchesAdvancedFromMeta(receipt.resultMetaXdr, investor);
+      }
+
+      if (eventTranches !== null) {
+        receipt.tranchesAdvanced = eventTranches;
+      } else {
+        // 2. Fallback Reconcile: If event not found or mock environment, reconcile against storage
+        try {
+          const statusAfter = await this.getSecondaryClaimStatus(poolContract, scValInvestor);
+          // Strict Attribution & Anti-Phantom Guard:
+          const totalDelta = statusAfter.claimed > statusBefore.claimed
+            ? (statusAfter.claimed - statusBefore.claimed)
+            : expectedAdvancement;
+          const actualAdvanced = Math.min(maxTranches, totalDelta);
+          receipt.tranchesAdvanced = actualAdvanced;
+        } catch (e) {
+          receipt.tranchesAdvanced = expectedAdvancement;
+        }
       }
     }
     return receipt;
@@ -682,7 +688,7 @@ export class KallpaKeeperDaemon {
       }
     }
 
-    let txConfirmedResult: { effectiveFeeCharged: bigint; returnValue?: xdr.ScVal };
+    let txConfirmedResult: { effectiveFeeCharged: bigint; returnValue?: xdr.ScVal; resultMetaXdr?: any };
     let sendRes: rpc.Api.SendTransactionResponse;
     let definitiveEnvelopeFee = 0n;
 
@@ -749,15 +755,71 @@ export class KallpaKeeperDaemon {
       effectiveFeeStroops: totalEffectiveFee,
       feeSpentStroops: totalEffectiveFee,
       payoutStroops: confirmedPayout,
+      resultMetaXdr: txConfirmedResult.resultMetaXdr,
     };
+  }
+
+  /**
+   * Extract tranchesAdvanced from transaction meta events if claim_sec event is found.
+   */
+  public extractTranchesAdvancedFromMeta(resultMetaXdr: any, expectedInvestor?: string): number | null {
+    if (!resultMetaXdr) return null;
+    try {
+      const meta = typeof resultMetaXdr === "string"
+        ? xdr.TransactionMeta.fromXDR(resultMetaXdr, "base64")
+        : resultMetaXdr;
+
+      const arm = typeof meta.arm === "function" ? meta.arm() : null;
+      let sorobanMeta = null;
+      if (arm === "v3" || meta.switch() === 3) {
+        sorobanMeta = meta.v3().sorobanMeta();
+      }
+      if (sorobanMeta) {
+        const events = sorobanMeta.events();
+        for (const ev of events) {
+          try {
+            const v0 = ev.body().v0();
+            const topics = v0.topics();
+            if (!topics || topics.length < 2) continue;
+            let sym = null;
+            try {
+              sym = topics[0].sym ? topics[0].sym().toString() : null;
+            } catch (e) {
+              if (topics[0].switch().name === "scvSymbol") {
+                sym = topics[0].sym().toString();
+              }
+            }
+            if (sym !== "claim_sec") continue;
+            if (expectedInvestor) {
+              const invNative = Address.fromScVal(topics[1]).toString();
+              if (invNative !== expectedInvestor) continue;
+            }
+            const dataVal = v0.data();
+            if (dataVal.switch().name === "scvVec" || dataVal.switch().value === xdr.ScValType.scvVec().value) {
+              const vec = dataVal.vec();
+              if (vec && vec.length >= 2) {
+                const start = vec[0].u32();
+                const end = vec[1].u32();
+                return end >= start ? end - start + 1 : 0;
+              }
+            }
+          } catch (inner) {}
+        }
+      }
+    } catch (e) {
+      return null;
+    }
+    return null;
   }
 
   /**
    * Poll RPC getTransaction with monotonic wall-clock deadline, abort signal for individual RPC calls,
    * timer cleanup, and post-verification to strictly reject late responses.
-   * Returns exact on-chain feeCharged and returnValue.
+   * Returns exact on-chain feeCharged, returnValue, and resultMetaXdr.
    */
-  private async waitForConfirmation(txHash: string): Promise<{ effectiveFeeCharged: bigint; returnValue?: xdr.ScVal }> {
+  private async waitForConfirmation(
+    txHash: string
+  ): Promise<{ effectiveFeeCharged: bigint; returnValue?: xdr.ScVal; resultMetaXdr?: any }> {
     const start = performance.now();
     const timeoutMs = 45000; // Strict 45s monotonic deadline
 
@@ -793,6 +855,7 @@ export class KallpaKeeperDaemon {
           return {
             effectiveFeeCharged: feeCharged,
             returnValue: (res as any).returnValue,
+            resultMetaXdr: (res as any).resultMetaXdr,
           };
         }
         if (res.status === "FAILED") {

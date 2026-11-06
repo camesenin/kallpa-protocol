@@ -5,7 +5,7 @@ pub mod types;
 #[cfg(test)]
 mod test;
 
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env};
 use crate::types::{DataKey, Error, PoolConfig, PoolState, Position};
 
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -712,6 +712,12 @@ impl KallpaPoolContract {
             let token_client = token::Client::new(&env, &config.asset);
             token_client.transfer(&env.current_contract_address(), &investor, &total_payout);
         }
+
+        // Publish authenticated on-chain event with exact start and end tranches for unambiguous attribution
+        env.events().publish(
+            (symbol_short!("claim_sec"), investor.clone()),
+            (start, end),
+        );
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(total_payout)

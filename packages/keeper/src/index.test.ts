@@ -1,3 +1,4 @@
+import { describe, expect, it } from "bun:test";
 import { KallpaKeeperDaemon, ClaimPayoutType, type KeeperConfig } from "./index";
 import { Keypair, xdr, Address, SorobanDataBuilder } from "@stellar/stellar-sdk";
 
@@ -836,5 +837,69 @@ describe("@kallpa/keeper", () => {
 
     resolveFirstCycle();
     await firstRunPromise;
+  });
+
+  it("strictly attributes tranchesAdvanced from transaction event metadata disproving concurrent overcounting", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const investor = Keypair.random().publicKey();
+
+    // Construct confirmed Soroban TransactionMeta with claim_sec event indicating start=5, end=9 (5 tranches)
+    const topic0 = xdr.ScVal.scvSymbol("claim_sec");
+    const investorScVal = new Address(investor).toScVal();
+    const eventData = xdr.ScVal.scvVec([xdr.ScVal.scvU32(5), xdr.ScVal.scvU32(9)]);
+
+    const eventV0 = new xdr.ContractEventV0({
+      topics: [topic0, investorScVal],
+      data: eventData,
+    });
+    const body = new xdr.ContractEventBody(0, eventV0);
+    const event = new xdr.ContractEvent({
+      ext: new xdr.ExtensionPoint(0),
+      contractId: null,
+      type: xdr.ContractEventType.contract(),
+      body: body,
+    });
+
+    const meta = new xdr.TransactionMeta(3, new xdr.TransactionMetaV3({
+      ext: new xdr.ExtensionPoint(0),
+      txChangesBefore: [],
+      operations: [],
+      txChangesAfter: [],
+      sorobanMeta: new xdr.SorobanTransactionMeta({
+        ext: new xdr.SorobanTransactionMetaExt(0),
+        events: [event],
+        returnValue: xdr.ScVal.scvU32(500),
+        diagnosticEvents: [],
+      }),
+    }));
+
+    // Mock executePermissionlessCall to return receipt with this resultMetaXdr
+    (daemon as any).executePermissionlessCall = async () => ({
+      txHash: "eventTxHash",
+      committedFeeStroops: 100000n,
+      effectiveFeeStroops: 100000n,
+      feeSpentStroops: 100000n,
+      payoutStroops: 500n,
+      resultMetaXdr: meta,
+    });
+
+    // Mock getSecondaryClaimStatus to simulate Codex counterexample:
+    // Suppose a third party concurrently advanced state such that totalDelta is 10,
+    // but the transaction itself only advanced 5 tranches (start=5, end=9).
+    let statusCallCount = 0;
+    (daemon as any).getSecondaryClaimStatus = async () => {
+      statusCallCount++;
+      if (statusCallCount === 1) {
+        return { total: 20, claimed: 0, remaining: 20 };
+      }
+      return { total: 20, claimed: 10, remaining: 10 }; // delta is 10!
+    };
+
+    const mockContract = {} as any;
+    const receipt = await daemon.disburseSecondaryRecoveryWithReceipt(mockContract, investor, 10);
+
+    // Assert that tranchesAdvanced is derived from the transaction event metadata (5),
+    // NOT the overcounted external delta (10)!
+    expect(receipt.tranchesAdvanced).toBe(5);
   });
 });
