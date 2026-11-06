@@ -1543,3 +1543,70 @@ fn test_metering_and_resource_limits_batches_1_25_50() {
     let (_, claimed_final) = setup.client.get_secondary_claim_status(&setup.investor1);
     assert_eq!(claimed_final, 107);
 }
+
+#[test]
+fn test_close_pool_bounded_slices_prevent_overflow_under_extreme_monetary_cap() {
+    let setup = setup_test();
+    let target = 10_000_000_000_000_000_000i128; // 10^19 stroops (1 trillion USDC, MAX_MONETARY_CAP)
+    let repayment_target = target;
+    let funding_deadline = 1000u64;
+    let repayment_deadline = 5000u64;
+    let min_contribution = 10_000_000i128;
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Single contributor funds entire 10^19 pool
+    setup.token_admin.mint(&setup.investor1, &target);
+    setup.client.contribute(&setup.investor1, &target);
+
+    // Full primary repayment settled
+    setup.token_admin.mint(&setup.payer, &target);
+    setup.client.settle_repayment(&setup.payer, &target);
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, crate::types::PoolState::Settled);
+
+    // Primary return claimed
+    let pri_claimed = setup.client.claim_return(&setup.investor1);
+    assert_eq!(pri_claimed, target);
+
+    // Inflow: 12 x 10^19 stroops deposited directly to contract address
+    let direct_inflow = 12 * target;
+    setup.token_admin.mint(&setup.contract_id, &direct_inflow);
+
+    // Reconcile incoming balance: materializes MAX_TRANCHES_PER_TX (10) slices of 10^19,
+    // leaving exactly 2 x 10^19 stroops in PendingSecondaryBuffer
+    let reconciled = setup.client.reconcile_incoming_balance(&setup.investor1);
+    assert_eq!(reconciled, direct_inflow);
+
+    let (tranches_reconciled, _) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(tranches_reconciled, 10);
+
+    // Now execute close_pool(): MUST NOT create a single massive tranche of 2 * 10^19!
+    // It must slice the buffer into bounded tranches of <= MAX_MONETARY_CAP (10^19),
+    // producing tranches 11 and 12, each of 10^19 stroops.
+    setup.client.close_pool(&setup.admin);
+    let (tranches_after_close, _) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(tranches_after_close, 12, "close_pool must slice buffer into 2 bounded tranches without exceeding MAX_MONETARY_CAP");
+
+    // Investor claims all 12 secondary tranches in batches:
+    // With proper bounded slices (each tranche <= 10^19), intermediate multiplication:
+    // cum_after * S_k = 10^19 * 10^19 = 10^38 <= i128::MAX (1.7 x 10^38), NEVER overflows!
+    let batch1_payout = setup.client.claim_secondary_recovery(&setup.investor1, &Some(10));
+    assert_eq!(batch1_payout, 10 * target);
+
+    let batch2_payout = setup.client.claim_secondary_recovery(&setup.investor1, &Some(10));
+    assert_eq!(batch2_payout, 2 * target);
+
+    let (_, final_claimed) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(final_claimed, 12);
+}

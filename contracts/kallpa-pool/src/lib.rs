@@ -863,24 +863,33 @@ impl KallpaPoolContract {
         // This guarantees that any direct SEP-41 transfer or late TW escrow refund is fully recognized.
         Self::internal_reconcile_surplus(&env, &config, state)?;
 
-        // Flush any remaining sub-threshold buffer if present
-        let pending: i128 = env
+        // Materialize any remaining buffer using record_secondary_tranche logic, strictly respecting MAX_MONETARY_CAP!
+        // If pending buffer remains (> 0), it must be flushed in bounded slices of MAX_MONETARY_CAP.
+        let mut pending: i128 = env
             .storage()
             .instance()
             .get(&DataKey::PendingSecondaryBuffer)
             .unwrap_or(0);
 
-        if pending > 0 {
+        while pending > 0 {
             let count: u32 = env
                 .storage()
                 .instance()
                 .get(&DataKey::SecondaryTrancheCount)
                 .unwrap_or(0);
 
+            let tranche_amount = if pending > MAX_MONETARY_CAP {
+                MAX_MONETARY_CAP
+            } else {
+                pending
+            };
+
+            pending = pending.checked_sub(tranche_amount).ok_or(Error::MathOverflow)?;
+
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
             env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
             let tranche_key = DataKey::SecondaryTranche(new_count);
-            env.storage().persistent().set(&tranche_key, &pending);
+            env.storage().persistent().set(&tranche_key, &tranche_amount);
             env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
             let total_sec: i128 = env
@@ -888,10 +897,11 @@ impl KallpaPoolContract {
                 .instance()
                 .get(&DataKey::TotalSecondaryAllocated)
                 .unwrap_or(0);
-            let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
+            let new_total_sec = total_sec.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
             env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
-            env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
         }
+
+        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
 
         env.storage().instance().set(&DataKey::State, &PoolState::Closed);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -935,14 +945,25 @@ impl KallpaPoolContract {
             .get(&DataKey::PendingSecondaryBuffer)
             .unwrap_or(0);
 
+        // Check non-negative obligations
+        if active_pri_obligation < 0 || active_sec_obligation < 0 || pending_buf < 0 {
+            return Err(Error::MathOverflow);
+        }
+
         let total_allocated_held = active_pri_obligation
             .checked_add(active_sec_obligation)
             .ok_or(Error::MathOverflow)?
             .checked_add(pending_buf)
             .ok_or(Error::MathOverflow)?;
 
+        // Invariant: Contract actual balance must strictly cover all active uncollected obligations!
+        // If actual_balance < total_allocated_held, pool is in critical deficit (accounting insolvency)
+        if actual_balance < total_allocated_held {
+            return Err(Error::InvalidAmount);
+        }
+
         let unallocated_surplus = actual_balance.checked_sub(total_allocated_held).ok_or(Error::MathOverflow)?;
-        if unallocated_surplus <= 0 {
+        if unallocated_surplus == 0 {
             return Ok(0);
         }
 

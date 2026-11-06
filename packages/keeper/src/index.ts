@@ -124,7 +124,10 @@ export class KallpaKeeperDaemon {
         fs.mkdirSync(dir, { recursive: true });
       }
       const tmpFile = `${this.storageFile}.tmp.${Date.now()}`;
-      fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), "utf-8");
+      const fd = fs.openSync(tmpFile, "w");
+      fs.writeFileSync(fd, JSON.stringify(list, null, 2), "utf-8");
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
       // Atomic rename guarantees crash-proof durable storage
       fs.renameSync(tmpFile, this.storageFile);
     } catch (e: any) {
@@ -230,9 +233,16 @@ export class KallpaKeeperDaemon {
     const now = Date.now();
     let networkCloseTime: number | null = null;
     try {
-      const latestLedger = await this.server.getLatestLedger();
-      if (latestLedger && typeof (latestLedger as any).closeTime === "number") {
-        networkCloseTime = (latestLedger as any).closeTime;
+      const latestLedger: any = await this.server.getLatestLedger();
+      if (latestLedger && latestLedger.closeTime !== undefined) {
+        if (typeof latestLedger.closeTime === "number") {
+          networkCloseTime = latestLedger.closeTime;
+        } else if (typeof latestLedger.closeTime === "string") {
+          const parsed = Number(latestLedger.closeTime);
+          if (!Number.isNaN(parsed) && parsed > 0) {
+            networkCloseTime = parsed;
+          }
+        }
       }
     } catch (e) {
       // Fallback if getLatestLedger RPC is unavailable
@@ -258,8 +268,8 @@ export class KallpaKeeperDaemon {
         continue;
       }
 
-      // 2. Safe timeout prune after 10m (well past 30s envelope validity timeout)
-      if (now - reservation.timestamp > 600_000) {
+      // 2. Fallback timeout prune after 10m ONLY IF ledger time is unavailable
+      if (!networkCloseTime && now - reservation.timestamp > 600_000) {
         this.pendingReservations.delete(txHash);
         changed = true;
       }
