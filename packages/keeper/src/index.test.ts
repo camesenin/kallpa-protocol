@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { KallpaKeeperDaemon, ClaimPayoutType, type KeeperConfig } from "./index";
-import { Keypair, xdr, Address, SorobanDataBuilder } from "@stellar/stellar-sdk";
+import { Keypair, xdr, Address, SorobanDataBuilder, StrKey } from "@stellar/stellar-sdk";
 
 describe("@kallpa/keeper", () => {
   const dummyKey = Keypair.random();
@@ -713,18 +713,47 @@ describe("@kallpa/keeper", () => {
       return { total: 100, claimed: 10, remaining: 90 };
     };
 
+    // Provide resultMetaXdr in executePermissionlessCall mock:
+    // With contract event indicating 2 tranches advanced (start: 8, end: 9 -> 2 tranches)
+    const topic0 = xdr.ScVal.scvSymbol("claim_sec");
+    const investorScVal = new Address(investor).toScVal();
+    const eventData = xdr.ScVal.scvVec([xdr.ScVal.scvU32(8), xdr.ScVal.scvU32(9)]);
+    const eventV0 = new xdr.ContractEventV0({
+      topics: [topic0, investorScVal],
+      data: eventData,
+    });
+    const body = new xdr.ContractEventBody(0, eventV0);
+    const event = new xdr.ContractEvent({
+      ext: new xdr.ExtensionPoint(0),
+      contractId: null,
+      type: xdr.ContractEventType.contract(),
+      body: body,
+    });
+    const meta = new xdr.TransactionMeta(3, new xdr.TransactionMetaV3({
+      ext: new xdr.ExtensionPoint(0),
+      txChangesBefore: [],
+      operations: [],
+      txChangesAfter: [],
+      sorobanMeta: new xdr.SorobanTransactionMeta({
+        ext: new xdr.SorobanTransactionMetaExt(0),
+        events: [event],
+        returnValue: xdr.ScVal.scvU32(0),
+        diagnosticEvents: [],
+      }),
+    }));
+
     (daemon as any).executePermissionlessCall = async () => ({
       txHash: "concurrentTxHash",
       feeSpentStroops: 100000n,
       committedFeeStroops: 100000n,
       effectiveFeeStroops: 100000n,
       payoutStroops: 0n,
+      resultMetaXdr: meta,
     });
 
     const receipt = await daemon.disburseSecondaryRecoveryWithReceipt(pool, investor, 50);
-    // Must record EXACT on-chain state delta (10 - 0 = 10), NOT the raw expected 50!
-    expect(receipt.tranchesAdvanced).toBe(10);
-    expect(queryCount).toBe(2);
+    // Must record EXACT on-chain event attribution (9 - 8 + 1 = 2), completely immune to external state delta!
+    expect(receipt.tranchesAdvanced).toBe(2);
   });
   it("executes complete 4-step restoration and invocation lifecycle: sim with preamble -> restore -> clean re-sim -> confirmed execution", async () => {
     const daemon = new KallpaKeeperDaemon(dummyConfig);
@@ -901,5 +930,56 @@ describe("@kallpa/keeper", () => {
     // Assert that tranchesAdvanced is derived from the transaction event metadata (5),
     // NOT the overcounted external delta (10)!
     expect(receipt.tranchesAdvanced).toBe(5);
+  });
+
+  it("strictly decodes TransactionMetaV4 events filtering by contractId and investor", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const investor = Keypair.random().publicKey();
+    const contractBytes = Buffer.alloc(32, 7);
+    const contractId = StrKey.encodeContract(contractBytes);
+
+    const topic0 = xdr.ScVal.scvSymbol("claim_sec");
+    const investorScVal = new Address(investor).toScVal();
+    const eventData = xdr.ScVal.scvVec([xdr.ScVal.scvU32(2), xdr.ScVal.scvU32(8)]);
+
+    const eventV0 = new xdr.ContractEventV0({
+      topics: [topic0, investorScVal],
+      data: eventData,
+    });
+    const body = new xdr.ContractEventBody(0, eventV0);
+    const matchingEvent = new xdr.ContractEvent({
+      ext: new xdr.ExtensionPoint(0),
+      contractId: contractBytes,
+      type: xdr.ContractEventType.contract(),
+      body: body,
+    });
+
+    // Dummy event from a different contract to test strict filtering
+    const dummyEvent = new xdr.ContractEvent({
+      ext: new xdr.ExtensionPoint(0),
+      contractId: Buffer.alloc(32, 9),
+      type: xdr.ContractEventType.contract(),
+      body: body,
+    });
+
+    const metaV4 = new xdr.TransactionMeta(4, new xdr.TransactionMetaV4({
+      ext: new xdr.ExtensionPoint(0),
+      txChangesBefore: [],
+      operations: [],
+      txChangesAfter: [],
+      sorobanMeta: null,
+      events: [matchingEvent, dummyEvent],
+      diagnosticEvents: [],
+    }));
+
+    const tranches = daemon.extractTranchesAdvancedFromMeta(metaV4, contractId, investor);
+    // 8 - 2 + 1 = 7 tranches
+    expect(tranches).toBe(7);
+
+    // Mismatched investor returns null
+    expect(daemon.extractTranchesAdvancedFromMeta(metaV4, contractId, Keypair.random().publicKey())).toBeNull();
+
+    // Mismatched contractId returns null
+    expect(daemon.extractTranchesAdvancedFromMeta(metaV4, dummyConfig.poolContractIds[0], investor)).toBeNull();
   });
 });

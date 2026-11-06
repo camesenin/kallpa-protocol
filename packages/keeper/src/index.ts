@@ -16,6 +16,7 @@ import {
   Address,
   SorobanDataBuilder,
   xdr,
+  StrKey,
 } from "@stellar/stellar-sdk";
 
 export interface KeeperConfig {
@@ -413,25 +414,16 @@ export class KallpaKeeperDaemon {
     if (receipt.txHash !== null) {
       // 1. Authoritative Attribution: Attempt exact derivation from confirmed transaction event metadata
       let eventTranches: number | null = null;
+      const contractId = typeof poolContract.contractId === "function" ? poolContract.contractId() : undefined;
       if (receipt.resultMetaXdr) {
-        eventTranches = this.extractTranchesAdvancedFromMeta(receipt.resultMetaXdr, investor);
+        eventTranches = this.extractTranchesAdvancedFromMeta(receipt.resultMetaXdr, contractId, investor);
       }
 
       if (eventTranches !== null) {
         receipt.tranchesAdvanced = eventTranches;
       } else {
-        // 2. Fallback Reconcile: If event not found or mock environment, reconcile against storage
-        try {
-          const statusAfter = await this.getSecondaryClaimStatus(poolContract, scValInvestor);
-          // Strict Attribution & Anti-Phantom Guard:
-          const totalDelta = statusAfter.claimed > statusBefore.claimed
-            ? (statusAfter.claimed - statusBefore.claimed)
-            : expectedAdvancement;
-          const actualAdvanced = Math.min(maxTranches, totalDelta);
-          receipt.tranchesAdvanced = actualAdvanced;
-        } catch (e) {
-          receipt.tranchesAdvanced = expectedAdvancement;
-        }
+        // 2. Strict Zero Attribution: If event not present in confirmed metadata, do NOT attribute phantom tranches!
+        receipt.tranchesAdvanced = 0;
       }
     }
     return receipt;
@@ -761,8 +753,14 @@ export class KallpaKeeperDaemon {
 
   /**
    * Extract tranchesAdvanced from transaction meta events if claim_sec event is found.
+   * Supports both TransactionMetaV3 and TransactionMetaV4, filtering strictly by contract ID,
+   * contract event type, topic symbol ("claim_sec"), and matching investor address.
    */
-  public extractTranchesAdvancedFromMeta(resultMetaXdr: any, expectedInvestor?: string): number | null {
+  public extractTranchesAdvancedFromMeta(
+    resultMetaXdr: any,
+    expectedContractId?: string,
+    expectedInvestor?: string
+  ): number | null {
     if (!resultMetaXdr) return null;
     try {
       const meta = typeof resultMetaXdr === "string"
@@ -770,46 +768,78 @@ export class KallpaKeeperDaemon {
         : resultMetaXdr;
 
       const arm = typeof meta.arm === "function" ? meta.arm() : null;
-      let sorobanMeta = null;
-      if (arm === "v3" || meta.switch() === 3) {
-        sorobanMeta = meta.v3().sorobanMeta();
-      }
-      if (sorobanMeta) {
-        const events = sorobanMeta.events();
-        for (const ev of events) {
-          try {
-            const v0 = ev.body().v0();
-            const topics = v0.topics();
-            if (!topics || topics.length < 2) continue;
-            let sym = null;
-            try {
-              sym = topics[0].sym ? topics[0].sym().toString() : null;
-            } catch (e) {
-              if (topics[0].switch().name === "scvSymbol") {
-                sym = topics[0].sym().toString();
-              }
-            }
-            if (sym !== "claim_sec") continue;
-            if (expectedInvestor) {
-              const invNative = Address.fromScVal(topics[1]).toString();
-              if (invNative !== expectedInvestor) continue;
-            }
-            const dataVal = v0.data();
-            if (dataVal.switch().name === "scvVec" || dataVal.switch().value === xdr.ScValType.scvVec().value) {
-              const vec = dataVal.vec();
-              if (vec && vec.length >= 2) {
-                const start = vec[0].u32();
-                const end = vec[1].u32();
-                return end >= start ? end - start + 1 : 0;
-              }
-            }
-          } catch (inner) {}
+      const switchVal = typeof meta.switch === "function" ? meta.switch() : null;
+      let events: any[] | null = null;
+
+      if (arm === "v3" || switchVal === 3) {
+        const sorobanMeta = meta.v3().sorobanMeta();
+        if (sorobanMeta) {
+          events = sorobanMeta.events();
+        }
+      } else if (arm === "v4" || switchVal === 4) {
+        events = meta.v4().events();
+        if (!events || events.length === 0) {
+          const sorobanMeta = meta.v4().sorobanMeta();
+          if (sorobanMeta && typeof sorobanMeta.events === "function") {
+            events = sorobanMeta.events();
+          }
         }
       }
+
+      if (!events || events.length === 0) return null;
+
+      let totalTranchesFound = 0;
+      let matchingEventsCount = 0;
+
+      for (const ev of events) {
+        try {
+          if (ev.type && ev.type().value !== xdr.ContractEventType.contract().value) {
+            continue;
+          }
+
+          if (expectedContractId && ev.contractId()) {
+            const evContractId = StrKey.encodeContract(ev.contractId());
+            if (evContractId !== expectedContractId) continue;
+          }
+
+          const v0 = ev.body().v0();
+          const topics = v0.topics();
+          if (!topics || topics.length < 2) continue;
+
+          let sym = null;
+          try {
+            sym = topics[0].sym ? topics[0].sym().toString() : null;
+          } catch (e) {
+            if (topics[0].switch().name === "scvSymbol") {
+              sym = topics[0].sym().toString();
+            }
+          }
+          if (sym !== "claim_sec") continue;
+
+          if (expectedInvestor) {
+            const invNative = Address.fromScVal(topics[1]).toString();
+            if (invNative !== expectedInvestor) continue;
+          }
+
+          const dataVal = v0.data();
+          if (dataVal.switch().name === "scvVec" || dataVal.switch().value === xdr.ScValType.scvVec().value) {
+            const vec = dataVal.vec();
+            if (vec && vec.length >= 2) {
+              const start = vec[0].u32();
+              const end = vec[1].u32();
+              if (end >= start) {
+                totalTranchesFound += (end - start + 1);
+                matchingEventsCount++;
+              }
+            }
+          }
+        } catch (inner) {}
+      }
+
+      return matchingEventsCount > 0 ? totalTranchesFound : null;
     } catch (e) {
       return null;
     }
-    return null;
   }
 
   /**
