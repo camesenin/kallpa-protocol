@@ -880,9 +880,6 @@ impl KallpaPoolContract {
 
         if pending > 0 {
             // Materialize remaining buffer into a final tranche if slots remain (count < MAX_SECONDARY_TRANCHES)
-            // If already at ceiling (count >= MAX_SECONDARY_TRANCHES), any incoming recovery is rejected
-            // prior to closure; but if a pending buffer already exists, it is merged into the final tranche (100)
-            // ensuring full titular pro-rata ownership by contributors without diverting to admin.
             let count: u32 = env
                 .storage()
                 .instance()
@@ -904,25 +901,9 @@ impl KallpaPoolContract {
                 let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
                 env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
                 env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
-            } else {
-                // If count is MAX_SECONDARY_TRANCHES, buffer is already 0 because record_secondary_tranche
-                // rejects new inflows once the ceiling is reached. If any rounding residual exists, it is merged
-                // into tranche MAX_SECONDARY_TRANCHES (100) ensuring investor ownership is 100% preserved.
-                let tranche_key = DataKey::SecondaryTranche(MAX_SECONDARY_TRANCHES);
-                let current_val: i128 = env.storage().persistent().get(&tranche_key).unwrap_or(0);
-                let new_val = current_val.checked_add(pending).ok_or(Error::MathOverflow)?;
-                env.storage().persistent().set(&tranche_key, &new_val);
-                env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-
-                let total_sec: i128 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::TotalSecondaryAllocated)
-                    .unwrap_or(0);
-                let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
-                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
-                env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
             }
+            // Note: If count == MAX_SECONDARY_TRANCHES, no new tranche is created and previous
+            // tranches are NOT modified, preserving absolute immutability and monotonicity of claimed_tranches.
         }
 
         env.storage().instance().set(&DataKey::State, &PoolState::Closed);
