@@ -61,7 +61,9 @@ $$\left| \sum_{k=1}^K P_{i,k} - E_i^{ideal} \right| < K \text{ stroops}$$
    - The admin can execute `close_pool` in Settled/Disputed state.
    - **Permissionless Non-Custodial Liveness Valve:** If the admin becomes unresponsive or abandons the pool, any participant (investor, keeper, relayer) can call `close_pool` permissionlessly strictly after 30 days past `repayment_deadline`.
    - **Bounded Progress:** At closure, any pending secondary buffer balance is materialized into discrete tranches subject to the shared per-tx budget ($r + f \le 10$). Once `PendingSecondaryBuffer == 0`, the pool state transitions to `Closed`.
-   - **Post-Closure Token Safety Valve:** `reconcile_incoming_balance` is permitted in `Closed` state exclusively as an emergency non-confiscation mechanism to recover direct, uncoordinated SEP-41 token transfers without locking funds. In standard protocol operations without external direct transfers, the tranche horizon is strictly bounded and finite.
+   - **Handling of Uncoordinated Transfers in Closed State:**
+     In the absence of external direct token transfers, the tranche horizon is strictly frozen and finite once `Closed` is reached ($K$ tranches).
+     If an uncoordinated external transfer lands on the contract address post-closure, `reconcile_incoming_balance` provides an invariant-based safety valve: it recognizes the surplus and pro-rata distributes it across the pool's existing investor positions. Because any such incoming transfer can create new tranches, the protocol guarantees **mathematical conservation and non-confiscation of funds**, while the finite bound on $K$ applies strictly to the closed universe of obligations originated by the loan lifecycle itself.
 
 ---
 
@@ -75,10 +77,10 @@ Crucially, in Soroban, `claim_secondary_recovery(investor, max_tranches)` proces
 
 | Investor Ticket $p$ | Pool Size $T$ | Pro-Rata Share $\frac{p}{T}$ | Total Recovery $A$ | Gross Recovery Payout | Self-Claim Gas Cost (1 tx) | Net Payout (Self-Claim) | Keeper Disbursed (Zero User Cost) |
 |---|---|---|---|---|---|---|---|
-| **$1.00 USDC** | $10,000 USDC | 0.01% (100 bps) | $50.00 USDC | **$0.005 USDC** | ~$0.003 USD | +$0.002 USDC | **+$0.005 USDC (100% net)** |
-| **$1.00 USDC** | $50,000 USDC | 0.002% (20 bps) | $50.00 USDC | **$0.001 USDC** | ~$0.003 USD | -$0.002 USD (Unviable) | **+$0.001 USDC (100% net)** |
-| **$10.00 USDC** | $50,000 USDC | 0.02% (200 bps) | $100.00 USDC | **$0.020 USDC** | ~$0.003 USD | +$0.017 USDC | **+$0.020 USDC (100% net)** |
-| **$50.00 USDC** | $50,000 USDC | 0.10% (1000 bps) | $500.00 USDC | **$0.500 USDC** | ~$0.003 USD | +$0.497 USDC | **+$0.500 USDC (100% net)** |
+| **$1.00 USDC** | $10,000 USDC | 0.01% (1 bp) | $50.00 USDC | **$0.005 USDC** | ~$0.003 USD | +$0.002 USDC | **+$0.005 USDC (100% net)** |
+| **$1.00 USDC** | $50,000 USDC | 0.002% (0.2 bp) | $50.00 USDC | **$0.001 USDC** | ~$0.003 USD | -$0.002 USD (Unviable) | **+$0.001 USDC (100% net)** |
+| **$10.00 USDC** | $50,000 USDC | 0.02% (2 bps) | $100.00 USDC | **$0.020 USDC** | ~$0.003 USD | +$0.017 USDC | **+$0.020 USDC (100% net)** |
+| **$50.00 USDC** | $50,000 USDC | 0.10% (10 bps) | $500.00 USDC | **$0.500 USDC** | ~$0.003 USD | +$0.497 USDC | **+$0.500 USDC (100% net)** |
 
 ### Economic Interpretation & Finite Keeper Operation:
 - Self-claiming is economically rational whenever $\frac{p}{T} A > C_{gas}$ (e.g. larger tickets or significant recovery amounts).

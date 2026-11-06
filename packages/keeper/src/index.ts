@@ -801,7 +801,10 @@ export class KallpaKeeperDaemon {
           this.pendingReservations.delete(computedRestoreHash);
           this.persistDurableReservations();
         }
-        throw new Error(`Restore footprint failed: ${errXdr}`);
+        const err: any = new Error(`Restore footprint failed: ${errXdr}`);
+        err.committedFeeStroops = definitiveRestoreFee;
+        err.effectiveFeeStroops = 0n;
+        throw err;
       }
 
       if (restoreSendRes.hash && restoreSendRes.hash !== computedRestoreHash) {
@@ -930,7 +933,10 @@ export class KallpaKeeperDaemon {
           this.pendingReservations.delete(computedTxHash);
           this.persistDurableReservations();
         }
-        throw new Error(`Transaction submission error: ${errXdr}`);
+        const err: any = new Error(`Transaction submission error: ${errXdr}`);
+        err.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
+        err.effectiveFeeStroops = totalEffectiveFee;
+        throw err;
       }
 
       // If the RPC returned a hash that matches or differs (e.g. envelope hash vs hash), update mapping
