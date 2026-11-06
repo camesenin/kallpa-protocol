@@ -798,6 +798,18 @@ export class KallpaKeeperDaemon {
       }
 
       preparedTx.sign(this.sponsorKey);
+      const computedTxHash = preparedTx.hash().toString("hex");
+
+      // WAL (Write-Ahead Logging): Persist reservation BEFORE dispatching to network.
+      // This strictly closes the crash window: if the process crashes during or immediately
+      // after sendTransaction, the reservation is already durably on disk upon reboot.
+      this.pendingReservations.set(computedTxHash, {
+        txHash: computedTxHash,
+        committedFeeStroops: definitiveEnvelopeFee,
+        timestamp: Date.now(),
+      });
+      this.persistDurableReservations();
+
       try {
         sendRes = await this.server.sendTransaction(preparedTx);
       } catch (transportErr: any) {
@@ -807,23 +819,30 @@ export class KallpaKeeperDaemon {
       }
 
       if (sendRes.status === "ERROR") {
+        this.pendingReservations.delete(computedTxHash);
+        this.persistDurableReservations();
         throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
       }
 
-      // Track pending reservation for in-flight transaction and persist immediately
-      this.pendingReservations.set(sendRes.hash, {
-        txHash: sendRes.hash,
-        committedFeeStroops: definitiveEnvelopeFee,
-        timestamp: Date.now(),
-      });
-      this.persistDurableReservations();
+      // If the RPC returned a hash that matches or differs (e.g. envelope hash vs hash), update mapping
+      if (sendRes.hash && sendRes.hash !== computedTxHash) {
+        this.pendingReservations.delete(computedTxHash);
+        this.pendingReservations.set(sendRes.hash, {
+          txHash: sendRes.hash,
+          committedFeeStroops: definitiveEnvelopeFee,
+          timestamp: Date.now(),
+        });
+        this.persistDurableReservations();
+      }
+
+      const activeHash = sendRes.hash || computedTxHash;
 
       try {
-        txConfirmedResult = await this.waitForConfirmation(sendRes.hash);
+        txConfirmedResult = await this.waitForConfirmation(activeHash);
         totalCommittedFee += definitiveEnvelopeFee;
         totalEffectiveFee += txConfirmedResult.effectiveFeeCharged;
         // Cleanly remove from pendingReservations upon confirmed execution
-        this.pendingReservations.delete(sendRes.hash);
+        this.pendingReservations.delete(activeHash);
         this.persistDurableReservations();
       } catch (confirmErr: any) {
         confirmErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;

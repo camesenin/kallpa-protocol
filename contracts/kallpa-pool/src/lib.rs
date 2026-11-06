@@ -76,22 +76,9 @@ impl KallpaPoolContract {
                 .unwrap_or(0);
 
             if count >= MAX_SECONDARY_TRANCHES {
-                // Ceiling reached: merge remaining balance directly into the final terminal tranche (50)
-                let final_key = DataKey::SecondaryTranche(MAX_SECONDARY_TRANCHES);
-                let current_final: i128 = env.storage().persistent().get(&final_key).unwrap_or(0);
-                let new_final = current_final.checked_add(combined).ok_or(Error::MathOverflow)?;
-                env.storage().persistent().set(&final_key, &new_final);
-                env.storage().persistent().extend_ttl(&final_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-
-                let total_sec: i128 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::TotalSecondaryAllocated)
-                    .unwrap_or(0);
-                let new_total_sec = total_sec.checked_add(combined).ok_or(Error::MathOverflow)?;
-                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
-
-                combined = 0;
+                // Ceiling reached: pool is permanently finalized for secondary tranches.
+                // Any subsequent late recovery or dust remains in PendingSecondaryBuffer
+                // and cannot create further tranches beyond MAX_SECONDARY_TRANCHES (100).
                 break;
             }
 
@@ -809,23 +796,9 @@ impl KallpaPoolContract {
                 .unwrap_or(0);
 
             if count >= MAX_SECONDARY_TRANCHES {
-                // Ceiling reached: merge remaining balance directly into the final terminal tranche (50)
-                let final_key = DataKey::SecondaryTranche(MAX_SECONDARY_TRANCHES);
-                let current_final: i128 = env.storage().persistent().get(&final_key).unwrap_or(0);
-                let new_final = current_final.checked_add(pending).ok_or(Error::MathOverflow)?;
-                env.storage().persistent().set(&final_key, &new_final);
-                env.storage().persistent().extend_ttl(&final_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-
-                let total_sec: i128 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::TotalSecondaryAllocated)
-                    .unwrap_or(0);
-                let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
-                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
-
-                total_flushed = total_flushed.checked_add(pending).ok_or(Error::MathOverflow)?;
-                pending = 0;
+                // Ceiling reached: pool is permanently finalized for secondary tranches.
+                // Any subsequent late recovery or dust remains in PendingSecondaryBuffer
+                // and cannot create further tranches beyond MAX_SECONDARY_TRANCHES (100).
                 break;
             }
 
