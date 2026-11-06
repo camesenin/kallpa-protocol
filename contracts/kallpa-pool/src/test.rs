@@ -1525,4 +1525,18 @@ fn test_metering_and_resource_limits_batches_1_25_50() {
     setup.client.flush_secondary_buffer(&setup.admin);
     let (total_after_flush, _) = setup.client.get_secondary_claim_status(&setup.investor1);
     assert_eq!(total_after_flush, 100, "Flush after ceiling must not create new tranches beyond 100");
+
+    // Close pool definitively
+    setup.client.close_pool(&setup.admin);
+    let (_, state, _, _) = setup.client.get_pool_info();
+    assert_eq!(state, crate::types::PoolState::Closed);
+
+    // Any late repayment after closure is strictly rejected
+    setup.token_admin.mint(&setup.payer, &10_000_000i128);
+    let late_res = setup.client.try_settle_repayment(&setup.payer, &10_000_000i128);
+    assert_eq!(late_res, Err(Ok(crate::types::Error::PoolClosed)));
+
+    // Investors can still claim their remaining tranches in Closed state
+    let claim_res = setup.client.claim_secondary_recovery(&setup.investor1, &Some(50));
+    assert!(claim_res >= 0);
 }

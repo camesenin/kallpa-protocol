@@ -23,6 +23,7 @@ pub enum Error {
     RepaymentDeadlinePassed = 17,
     AmountBelowMinRecovery = 18,
     BatchLimitExceeded = 19,
+    PoolClosed = 20,
 }
 
 #[contracttype]
@@ -34,6 +35,7 @@ pub enum PoolState {
     Settled = 2,
     Refundable = 3,
     Disputed = 4,
+    Closed = 5,
 }
 
 #[contracttype]

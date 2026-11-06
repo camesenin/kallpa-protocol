@@ -176,6 +176,10 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
+        if state == PoolState::Closed {
+            return Err(Error::PoolClosed);
+        }
+
         if state != PoolState::Open {
             return Err(Error::PoolNotOpen);
         }
@@ -288,6 +292,10 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
+        if state == PoolState::Closed {
+            return Err(Error::PoolClosed);
+        }
+
         if amount <= 0 || amount > MAX_MONETARY_CAP {
             return Err(Error::InvalidAmount);
         }
@@ -365,6 +373,10 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
+        if state == PoolState::Closed {
+            return Err(Error::PoolClosed);
+        }
+
         if state != PoolState::Funded {
             return Err(Error::PoolNotFunded);
         }
@@ -402,6 +414,10 @@ impl KallpaPoolContract {
             .instance()
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
+
+        if state == PoolState::Closed {
+            return Err(Error::PoolClosed);
+        }
 
         // Allow dispute refund from Funded (primary transition to Disputed), or from Settled/Disputed (accumulating into SecondaryRecovery)
         if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
@@ -473,8 +489,8 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        // Claims are accessible both on Settled and Disputed state (exact pro-rata refund of recovered funds)
-        if state != PoolState::Settled && state != PoolState::Disputed {
+        // Claims are accessible on Settled, Disputed, or Closed state (exact pro-rata refund of recovered funds)
+        if state != PoolState::Settled && state != PoolState::Disputed && state != PoolState::Closed {
             return Err(Error::PoolNotSettled);
         }
 
@@ -637,7 +653,8 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        if state != PoolState::Settled && state != PoolState::Disputed {
+        // Claims are permitted on Settled, Disputed, or Closed (allowing complete recovery claim even after closure)
+        if state != PoolState::Settled && state != PoolState::Disputed && state != PoolState::Closed {
             return Err(Error::PoolNotSettled);
         }
 
@@ -753,7 +770,8 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        if state != PoolState::Settled && state != PoolState::Disputed {
+        // Claims are permitted on Settled, Disputed, or Closed (allowing complete recovery claim even after closure)
+        if state != PoolState::Settled && state != PoolState::Disputed && state != PoolState::Closed {
             return Err(Error::PoolNotSettled);
         }
 
@@ -833,6 +851,64 @@ impl KallpaPoolContract {
         Ok(total_flushed)
     }
 
+    /// Permanent Terminal Closure of the pool:
+    /// Once the pool is in Settled or Disputed state, and all remaining pending buffer balance
+    /// has been flushed into a terminal tranche (or buffer is 0), any caller (keeper, admin, or contributor)
+    /// can seal the pool by transitioning state to Closed.
+    /// This prevents any further incoming late repayments, permanently freezes the tranche count,
+    /// and bounds the lifetime tranche creation horizon once and for all.
+    /// All participants retain 100% permissionless access to claim their existing entitled tranches.
+    pub fn close_pool(env: Env, caller: Address) -> Result<(), Error> {
+        caller.require_auth();
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state != PoolState::Settled && state != PoolState::Disputed {
+            return Err(Error::PoolNotSettled);
+        }
+
+        // Flush any remaining sub-threshold buffer if present
+        let pending: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSecondaryBuffer)
+            .unwrap_or(0);
+
+        if pending > 0 {
+            // Check if we can create a final tranche
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+
+            if count < MAX_SECONDARY_TRANCHES {
+                let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+                env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+                let tranche_key = DataKey::SecondaryTranche(new_count);
+                env.storage().persistent().set(&tranche_key, &pending);
+                env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+                let total_sec: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalSecondaryAllocated)
+                    .unwrap_or(0);
+                let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
+                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+                env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+            }
+        }
+
+        env.storage().instance().set(&DataKey::State, &PoolState::Closed);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        Ok(())
+    }
+
     /// Autonomous onchain reconciliation of funds returned directly by Trustless Work or external escrow.
     /// Eliminates reliance on active admin approval or second token transfers:
     /// Any participant can call this function to inspect the contract's actual token balance,
@@ -852,6 +928,10 @@ impl KallpaPoolContract {
             .instance()
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
+
+        if state == PoolState::Closed {
+            return Err(Error::PoolClosed);
+        }
 
         if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
             return Err(Error::PoolNotFunded);
