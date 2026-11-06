@@ -221,6 +221,7 @@ describe("@kallpa/keeper", () => {
     });
 
     daemon.isSecondaryClaimExhausted = async () => false;
+    daemon.getSecondaryClaimStatus = async () => ({ total: 100, claimed: 0, remaining: 100 });
 
     (daemon as any).disburseSecondaryRecoveryWithReceipt = async (
       _contract: any,
@@ -353,6 +354,7 @@ describe("@kallpa/keeper", () => {
     });
 
     daemon.isSecondaryClaimExhausted = async () => false;
+    daemon.getSecondaryClaimStatus = async () => ({ total: 100, claimed: 0, remaining: 100 });
 
     const investor1 = Keypair.random().publicKey();
     const investor2 = Keypair.random().publicKey();
@@ -460,7 +462,7 @@ describe("@kallpa/keeper", () => {
         results: [{ auth: [], xdr: null }],
         transactionData: new SorobanDataBuilder().build(),
         restorePreamble: {
-          minResourceFee: "100000", // 100k restoration fee
+          minResourceFee: "100000", // 100k restoration fee (total envelope 200k)
           transactionData: new SorobanDataBuilder().build(),
         },
       }),
@@ -526,6 +528,7 @@ describe("@kallpa/keeper", () => {
       availableStroops: 80_000_000n,
     });
     daemon.isSecondaryClaimExhausted = async () => false;
+    daemon.getSecondaryClaimStatus = async () => ({ total: 100, claimed: 0, remaining: 100 });
 
     const investor1 = Keypair.random().publicKey();
     const investorUnknown = Keypair.random().publicKey();
@@ -587,5 +590,109 @@ describe("@kallpa/keeper", () => {
     expect(failedErr).toBeDefined();
     expect(failedErr.message).toContain("execution failed on-chain");
     expect(failedErr.effectiveFeeCharged).toBe(145000n);
+  });
+  it("regression: pre-flight quota reservation blocks batch when batch advancement exceeds remaining zero-payout quota", async () => {
+    const daemon = new KallpaKeeperDaemon({
+      ...dummyConfig,
+      maxZeroPayoutTranchesPerCycle: 1, // Only 1 zero-payout tranche allowed
+    });
+    const poolId = dummyConfig.poolContractIds[0];
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    const investor = Keypair.random().publicKey();
+    // Investor has 50 remaining tranches
+    daemon.getSecondaryClaimStatus = async () => ({
+      total: 100,
+      claimed: 50,
+      remaining: 50,
+    });
+
+    // Simulated payout is 0 (Zero payout)
+    daemon.isClaimZeroPayout = async () => ClaimPayoutType.Zero;
+
+    let disburseCalled = false;
+    (daemon as any).disburseSecondaryRecoveryWithReceipt = async () => {
+      disburseCalled = true;
+      return {
+        txHash: "mockHash",
+        committedFeeStroops: 100000n,
+        effectiveFeeStroops: 80000n,
+        feeSpentStroops: 80000n,
+        payoutStroops: 0n,
+      };
+    };
+
+    // Target requests batch of 50 tranches. Remaining quota is 1.
+    // Pre-flight quota check must reject the batch BEFORE dispatch!
+    const targets = new Map([
+      [
+        poolId,
+        [{ investor, action: "claim_secondary" as const, maxTranches: 50 }],
+      ],
+    ]);
+
+    const result = await daemon.runSweepCycle(targets);
+    expect(disburseCalled).toBe(false);
+    expect(result.processed).toBe(0);
+    expect(result.confirmedZeroPayoutAdvancements).toBe(0);
+  });
+
+  it("regression: preserves exact effectiveFeeCharged on FAILED restoration transaction", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const poolId = dummyConfig.poolContractIds[0];
+
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    (daemon as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => ({
+        minResourceFee: "50000",
+        results: [{ auth: [], xdr: null }],
+        transactionData: new SorobanDataBuilder().build(),
+        restorePreamble: {
+          minResourceFee: "100000", // 100k restoration fee (definitive fee 200k)
+          transactionData: new SorobanDataBuilder().build(),
+        },
+      }),
+      sendTransaction: async () => ({ status: "SUCCESS", hash: "restoreFailedHash" }),
+    };
+
+    // Restoration transaction confirmed as FAILED on-chain, charging exact 145,000 stroops
+    const failedErr: any = new Error("Transaction restoreFailedHash execution failed on-chain");
+    failedErr.effectiveFeeCharged = 145000n;
+    (daemon as any).waitForConfirmation = async () => {
+      throw failedErr;
+    };
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    const realContract = new Contract(poolId);
+    let capturedErr: any = null;
+    try {
+      await (daemon as any).executePermissionlessCall(
+        realContract,
+        "claim_return",
+        [new Address(Keypair.random().publicKey()).toScVal()],
+        300000n
+      );
+    } catch (err: any) {
+      capturedErr = err;
+    }
+
+    expect(capturedErr).toBeDefined();
+    // committedFeeStroops preserves the 200k ceiling reservation
+    expect(capturedErr.committedFeeStroops).toBe(200000n);
+    // effectiveFeeStroops reflects the EXACT fee charged by Stellar Core (145k), NOT the 200k ceiling!
+    expect(capturedErr.effectiveFeeStroops).toBe(145000n);
   });
 });

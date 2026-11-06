@@ -48,6 +48,7 @@ export interface ClaimExecutionReceipt {
   effectiveFeeStroops: bigint; // Exact on-chain fee charged after confirmed execution
   feeSpentStroops: bigint; // Backwards compatible alias for effectiveFeeStroops
   payoutStroops: bigint; // Confirmed on-chain payout amount returned by contract invocation
+  tranchesAdvanced?: number; // Exact count of persistent tranches advanced on-chain
 }
 
 export class KallpaKeeperDaemon {
@@ -205,7 +206,8 @@ export class KallpaKeeperDaemon {
 
         const remainingBudget = maxSweepBudget - totalCommittedFeeStroops;
 
-        // Individual claim zero-payout check: evaluate target before deciding to disburse or skip
+        // Secondary claim pre-flight quota reservation & status verification:
+        let expectedBatchAdvancement = 0;
         if (target.action === "claim_secondary") {
           const investorVal = new Address(target.investor).toScVal();
           const isExhausted = await this.isSecondaryClaimExhausted(poolContract, investorVal);
@@ -213,16 +215,26 @@ export class KallpaKeeperDaemon {
             skippedExhausted++;
             continue;
           }
-          if (confirmedZeroPayoutAdvancements >= maxZeroPayouts) {
-            // Ternary payout classification: do NOT treat Unknown simulation failures as Positive!
+
+          const claimStatus = await this.getSecondaryClaimStatus(poolContract, investorVal);
+          const requestedBatch = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
+          // Exact persistent tranches that will be advanced: min(requestedBatch, remaining)
+          expectedBatchAdvancement = claimStatus.remaining > 0 ? Math.min(requestedBatch, claimStatus.remaining) : requestedBatch;
+
+          // STRICT PRE-FLIGHT QUOTA RESERVATION:
+          // Check if adding expectedBatchAdvancement exceeds remaining zero-payout subsidy budget
+          const remainingZeroPayoutQuota = maxZeroPayouts - confirmedZeroPayoutAdvancements;
+          if (expectedBatchAdvancement > remainingZeroPayoutQuota) {
+            // Proposed batch cannot fit entirely into remaining subsidy quota.
+            // Check if claim yields positive payout or is zero/unknown:
             const payoutType = await this.isClaimZeroPayout(
               poolContract,
               "claim_secondary_recovery",
-              [investorVal, xdr.ScVal.scvU32(target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch)]
+              [investorVal, xdr.ScVal.scvU32(requestedBatch)]
             );
             if (payoutType === ClaimPayoutType.Zero || payoutType === ClaimPayoutType.Unknown) {
               console.warn(
-                `Max zero payout subsidized advancements reached (${confirmedZeroPayoutAdvancements} >= ${maxZeroPayouts}). Skipping ${payoutType} claim for ${target.investor}.`
+                `Subsidized zero-payout batch (${expectedBatchAdvancement} tranches) exceeds remaining quota (${remainingZeroPayoutQuota}). Skipping ${payoutType} claim for ${target.investor}.`
               );
               continue;
             }
@@ -262,8 +274,9 @@ export class KallpaKeeperDaemon {
           } else {
             processed++;
             if (receipt.payoutStroops === 0n && target.action === "claim_secondary") {
-              const tranchesAdvanced = target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch;
-              confirmedZeroPayoutAdvancements += tranchesAdvanced;
+              // Count EXACT confirmed on-chain tranches advanced from receipt or pre-flight calculation
+              const actualAdvanced = receipt.tranchesAdvanced !== undefined ? receipt.tranchesAdvanced : (expectedBatchAdvancement > 0 ? expectedBatchAdvancement : (target.maxTranches !== undefined ? target.maxTranches : this.config.maxTranchesPerBatch));
+              confirmedZeroPayoutAdvancements += actualAdvanced;
             }
           }
         } catch (err: any) {
@@ -363,18 +376,30 @@ export class KallpaKeeperDaemon {
     const scValInvestor = new Address(investor).toScVal();
     const scValMax = xdr.ScVal.scvU32(maxTranches);
 
-    return this.executePermissionlessCall(
+    // Pre-query status to record exact persistent tranches to be advanced
+    const statusBefore = await this.getSecondaryClaimStatus(poolContract, scValInvestor);
+    const expectedAdvancement = statusBefore.remaining > 0 ? Math.min(maxTranches, statusBefore.remaining) : maxTranches;
+
+    const receipt = await this.executePermissionlessCall(
       poolContract,
       "claim_secondary_recovery",
       [scValInvestor, scValMax],
       remainingBudget
     );
+    if (receipt.txHash !== null) {
+      receipt.tranchesAdvanced = expectedAdvancement;
+    }
+    return receipt;
   }
 
   /**
-   * Check if investor has already claimed all secondary tranches
+   * Query contract for investor's current secondary recovery claim status: (total_tranches, claimed_tranches).
+   * Returns exact tuple from contract storage.
    */
-  public async isSecondaryClaimExhausted(poolContract: Contract, investorVal: xdr.ScVal): Promise<boolean> {
+  public async getSecondaryClaimStatus(
+    poolContract: Contract,
+    investorVal: xdr.ScVal
+  ): Promise<{ total: number; claimed: number; remaining: number }> {
     try {
       const sponsorAccount = await this.server.getAccount(this.sponsorKey.publicKey());
       const tx = new TransactionBuilder(sponsorAccount, {
@@ -393,12 +418,25 @@ export class KallpaKeeperDaemon {
           if (vec && vec.length >= 2) {
             const total = vec[0].u32();
             const claimed = vec[1].u32();
-            return total <= claimed;
+            const remaining = total > claimed ? total - claimed : 0;
+            return { total, claimed, remaining };
           }
         }
       }
     } catch (e) {
-      // Fallback: do not short-circuit on inspection error
+      // Fallback on inspection error
+    }
+    return { total: 0, claimed: 0, remaining: 0 };
+  }
+
+  /**
+   * Check if investor has already claimed all secondary tranches
+   */
+  public async isSecondaryClaimExhausted(poolContract: Contract, investorVal: xdr.ScVal): Promise<boolean> {
+    const status = await this.getSecondaryClaimStatus(poolContract, investorVal);
+    // If status returns total > 0 and remaining === 0, it is definitively exhausted
+    if (status.total > 0 && status.remaining === 0) {
+      return true;
     }
     return false;
   }
@@ -479,7 +517,17 @@ export class KallpaKeeperDaemon {
       }
     }
 
-    let preparedTx = rpc.assembleTransaction(tx, simRes).build();
+    const preparedTxBuilder = rpc.assembleTransaction(tx, simRes);
+    if (simRes.minResourceFee) {
+      const rawData =
+        simRes.transactionData && typeof (simRes.transactionData as any).build === "function"
+          ? (simRes.transactionData as any).build()
+          : simRes.transactionData;
+      const sorobanDataBuilder = new SorobanDataBuilder(rawData);
+      sorobanDataBuilder.setResourceFee(simRes.minResourceFee);
+      preparedTxBuilder.setSorobanData(sorobanDataBuilder.build());
+    }
+    let preparedTx = preparedTxBuilder.build();
     let totalCommittedFee = 0n;
     let totalEffectiveFee = 0n;
 
@@ -550,9 +598,11 @@ export class KallpaKeeperDaemon {
         totalCommittedFee += definitiveRestoreFee;
         totalEffectiveFee += restoreTxMeta.effectiveFeeCharged;
       } catch (err: any) {
-        // Track committed fee on failure
+        // Track committed fee on failure:
+        // Always preserve the 200k maximum committed envelope fee for cycle budget safety,
+        // but record the EXACT effective fee charged if extracted from FAILED transaction resultXdr!
         err.committedFeeStroops = definitiveRestoreFee;
-        err.effectiveFeeStroops = definitiveRestoreFee;
+        err.effectiveFeeStroops = (err && typeof err.effectiveFeeCharged === "bigint") ? err.effectiveFeeCharged : definitiveRestoreFee;
         throw err;
       }
 
@@ -575,7 +625,17 @@ export class KallpaKeeperDaemon {
         if (freshSim.restorePreamble && freshSim.restorePreamble.minResourceFee) {
           throw new Error("Re-simulation unexpectedly required second restoration preamble");
         }
-        preparedTx = rpc.assembleTransaction(freshTx, freshSim).build();
+        const freshTxBuilder = rpc.assembleTransaction(freshTx, freshSim);
+        if (freshSim.minResourceFee) {
+          const rawData =
+            freshSim.transactionData && typeof (freshSim.transactionData as any).build === "function"
+              ? (freshSim.transactionData as any).build()
+              : freshSim.transactionData;
+          const sorobanDataBuilder = new SorobanDataBuilder(rawData);
+          sorobanDataBuilder.setResourceFee(freshSim.minResourceFee);
+          freshTxBuilder.setSorobanData(sorobanDataBuilder.build());
+        }
+        preparedTx = freshTxBuilder.build();
       } catch (postRestoreErr: any) {
         postRestoreErr.committedFeeStroops = totalCommittedFee;
         postRestoreErr.effectiveFeeStroops = totalEffectiveFee;
