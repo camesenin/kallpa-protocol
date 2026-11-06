@@ -804,4 +804,37 @@ describe("@kallpa/keeper", () => {
     // Restoration (100k) + Invocation (105k) = 205k total effective fee
     expect(receipt.effectiveFeeStroops).toBe(205000n);
   });
+  it("strictly rejects concurrent sweep cycle dispatches on the same keeper instance", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const poolId = dummyConfig.poolContractIds[0];
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    // Mock long-running execution for first cycle
+    let resolveFirstCycle: () => void = () => {};
+    const firstCycleWait = new Promise<void>((r) => {
+      resolveFirstCycle = r;
+    });
+
+    (daemon as any).disburseClaimReturnWithReceipt = async () => {
+      await firstCycleWait;
+      return { txHash: "mockTxHash", feeSpentStroops: 100000n, committedFeeStroops: 100000n, effectiveFeeStroops: 100000n, payoutStroops: 1000n };
+    };
+
+    const targets = new Map([
+      [poolId, [{ investor: Keypair.random().publicKey(), action: "claim_return" as const }]],
+    ]);
+
+    const firstRunPromise = daemon.runSweepCycle(targets);
+
+    // Second concurrent run MUST immediately reject with mutual exclusion error
+    expect(daemon.runSweepCycle(targets)).rejects.toThrow("Concurrent sweep cycle rejected");
+
+    resolveFirstCycle();
+    await firstRunPromise;
+  });
 });

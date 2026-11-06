@@ -55,6 +55,7 @@ export class KallpaKeeperDaemon {
   private server: rpc.Server;
   private sponsorKey: Keypair;
   private config: KeeperConfig;
+  private isSweepCycleActive: boolean = false;
 
   constructor(config: KeeperConfig) {
     this.config = config;
@@ -150,6 +151,28 @@ export class KallpaKeeperDaemon {
    * and short-circuiting of zero-payout claims to prevent wasting sponsor funds.
    */
   async runSweepCycle(
+    targetsByPool: Map<string, InvestorClaimTarget[]>
+  ): Promise<{
+    processed: number;
+    errors: number;
+    skippedForLowFunds: boolean;
+    skippedExhausted: number;
+    confirmedZeroPayoutAdvancements: number;
+    totalFeeSpentStroops: bigint;
+    totalCommittedFeeStroops: bigint;
+  }> {
+    if (this.isSweepCycleActive) {
+      throw new Error("Concurrent sweep cycle rejected: daemon is already executing an active cycle");
+    }
+    this.isSweepCycleActive = true;
+    try {
+      return await this._runSweepCycleInternal(targetsByPool);
+    } finally {
+      this.isSweepCycleActive = false;
+    }
+  }
+
+  private async _runSweepCycleInternal(
     targetsByPool: Map<string, InvestorClaimTarget[]>
   ): Promise<{
     processed: number;
@@ -390,9 +413,16 @@ export class KallpaKeeperDaemon {
       // Reconcile exact on-chain advancement by querying state after execution
       try {
         const statusAfter = await this.getSecondaryClaimStatus(poolContract, scValInvestor);
-        const actualAdvanced = statusAfter.claimed > statusBefore.claimed
+        // Strict Attribution & Anti-Phantom Guard:
+        // Our transaction requested at most `maxTranches`.
+        // If an external actor advanced tranches concurrently, the total delta (statusAfter.claimed - statusBefore.claimed)
+        // might exceed maxTranches. Our transaction could only advance at most:
+        // min(maxTranches, statusAfter.claimed - statusBefore.claimed).
+        // Furthermore, if our transaction yielded a positive payout, it advanced at least 1 tranche.
+        const totalDelta = statusAfter.claimed > statusBefore.claimed
           ? (statusAfter.claimed - statusBefore.claimed)
           : expectedAdvancement;
+        const actualAdvanced = Math.min(maxTranches, totalDelta);
         receipt.tranchesAdvanced = actualAdvanced;
       } catch (e) {
         receipt.tranchesAdvanced = expectedAdvancement;
