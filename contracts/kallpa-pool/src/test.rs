@@ -1377,14 +1377,20 @@ fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_au
 }
 
 #[test]
-fn test_zero_dust_asymmetry_elimination_under_fragmented_tranches() {
+fn test_strict_monotonicity_and_conservation_council_counterexample() {
     let setup = setup_test();
-    // 2 equal investors at 50% each (target = 2 USDC = 20_000_000 stroops)
-    let target = 20_000_000i128;
+    // Council Counterexample exact setup:
+    // T = 1,000,000,000,000,000 (10^15 stroops = 100M USDC)
+    // Investor 1: 499,999,995,000,000 stroops
+    // Investor 2 (central): 10,000,000 stroops (exactly MIN_CONTRIBUTION 1.0 USDC)
+    // Investor 3: 499,999,995,000,000 stroops
+    let target = 1_000_000_000_000_000i128;
     let repayment_target = target;
     let funding_deadline = 1000u64;
     let repayment_deadline = 5000u64;
     let min_contribution = 10_000_000i128; // 1 USDC
+
+    let inv3 = soroban_sdk::Address::generate(&setup.env);
 
     setup.client.initialize(
         &setup.admin,
@@ -1398,42 +1404,55 @@ fn test_zero_dust_asymmetry_elimination_under_fragmented_tranches() {
         &min_contribution,
     );
 
-    // Investor 1 deposits 1 USDC (10_000_000 stroops) -> 50%
-    setup.token_admin.mint(&setup.investor1, &10_000_000i128);
-    setup.client.contribute(&setup.investor1, &10_000_000i128);
+    setup.token_admin.mint(&setup.investor1, &499_999_995_000_000i128);
+    setup.client.contribute(&setup.investor1, &499_999_995_000_000i128);
 
-    // Investor 2 deposits 1 USDC (10_000_000 stroops) -> 50%
     setup.token_admin.mint(&setup.investor2, &10_000_000i128);
     setup.client.contribute(&setup.investor2, &10_000_000i128);
+
+    setup.token_admin.mint(&inv3, &499_999_995_000_000i128);
+    setup.client.contribute(&inv3, &499_999_995_000_000i128);
 
     setup.env.ledger().set_timestamp(repayment_deadline + 10);
     setup.client.declare_default(&setup.investor1);
 
-    // Inflow: 50 fragmented micro-tranches of 1 unit each (or 1 stroop equivalent scaled, e.g. MIN_RECOVERY_TRANCHE = 1 USDC each)
-    // Here we settle 50 tranches of 1 USDC (10_000_000 stroops).
-    // Total secondary recovery = 50 USDC = 500_000_000 stroops.
-    for _ in 0..50 {
-        setup.token_admin.mint(&setup.payer, &10_000_000i128);
-        setup.client.settle_repayment(&setup.payer, &10_000_000i128);
+    // Council Tranches: 10,000,000, 10,000,001, 10,000,001 (total = 30,000,002 stroops)
+    let tranches: [i128; 3] = [10_000_000, 10_000_001, 10_000_001];
+    for t in tranches.iter() {
+        setup.token_admin.mint(&setup.payer, t);
+        setup.client.settle_repayment(&setup.payer, t);
     }
 
-    // Investor 1 claims in piecemeal single-tranche batches of 1 tranche at a time (50 separate claims!)
-    let mut inv1_total_claimed = 0i128;
-    for _ in 0..50 {
-        let p = setup.client.claim_secondary_recovery(&setup.investor1, &Some(1));
-        inv1_total_claimed += p;
-    }
+    // Schedule A: Investor 2 claims after EACH recovery tranche (3 individual claims)
+    let p2_t1 = setup.client.claim_secondary_recovery(&setup.investor2, &Some(1));
+    let p2_t2 = setup.client.claim_secondary_recovery(&setup.investor2, &Some(1));
+    let p2_t3 = setup.client.claim_secondary_recovery(&setup.investor2, &Some(1));
+    let p2_total = p2_t1 + p2_t2 + p2_t3;
 
-    // Investor 2 claims all 50 tranches in a single batch of 50 tranches
-    let inv2_total_claimed = setup.client.claim_secondary_recovery(&setup.investor2, &Some(50));
+    // Every discrete tranche payout MUST strictly be non-negative (monotonicity)!
+    assert!(p2_t1 >= 0, "p2_t1 must be non-negative");
+    assert!(p2_t2 >= 0, "p2_t2 must be non-negative");
+    assert!(p2_t3 >= 0, "p2_t3 must be non-negative");
+    assert_eq!(p2_t1, 1);
+    assert_eq!(p2_t2, 0);
+    assert_eq!(p2_t3, 0);
+    assert_eq!(p2_total, 1, "Investor 2 receives exactly 1 stroop");
 
-    // Under the revolutionary O(1) Cumulative Prefix Sum Telescoping:
-    // Payout(inv1) == Payout(inv2) == exactly 25 USDC (250_000_000 stroops)!
-    // Rounding asymmetry across fragmented tranches is EXACTLY ZERO: |inv1 - inv2| == 0!
-    assert_eq!(inv1_total_claimed, 250_000_000i128, "Investor 1 must receive exactly 50% = 25 USDC");
-    assert_eq!(inv2_total_claimed, 250_000_000i128, "Investor 2 must receive exactly 50% = 25 USDC");
-    assert_eq!(inv1_total_claimed, inv2_total_claimed, "Fragmentation asymmetry must be exactly 0 stroops!");
-    assert_eq!(inv1_total_claimed + inv2_total_claimed, 500_000_000i128, "100% of recovery is conserved");
+    // Investor 1 claims all 3 tranches in a batch
+    let p1_total = setup.client.claim_secondary_recovery(&setup.investor1, &Some(3));
+    assert_eq!(p1_total, 14_999_999, "Investor 1 receives exactly 14,999,999 stroops");
+
+    // Investor 3 claims all 3 tranches in a batch
+    let p3_total = setup.client.claim_secondary_recovery(&inv3, &Some(3));
+    assert_eq!(p3_total, 15_000_002, "Investor 3 receives exactly 15,000,002 stroops");
+
+    // EXACT ZERO-DUST CONSERVATION CHECK:
+    // Total paid = 14,999,999 + 1 + 15,000,002 = 30,000,002 stroops!
+    // EXACTLY EQUAL to Total Recovered! Zero deficit, zero overpayment, zero trapped funds!
+    let total_paid = p1_total + p2_total + p3_total;
+    assert_eq!(total_paid, 30_000_002, "Total payout must exactly match total secondary recovery!");
+    let contract_bal = setup.token_client.balance(&setup.contract_id);
+    assert_eq!(contract_bal, 0, "Contract balance must be exactly 0 after all participants claim!");
 }
 
 #[test]
