@@ -7,24 +7,58 @@ This document details the exact economic mechanisms, transaction fee benchmarks,
 ## 1. The Economic Micro-Claim Problem & Multi-Layer Resolution
 
 In decentralized lending pools with pro-rata dispute or secondary liquidation recoveries, fractional entitlements can emerge:
-- Example: An investor contributed $1.00 USDC ($10,000,000$ base units with 7 decimals) to a $1,000.00$ USDC pool ($10^{10}$ base units).
+- Example: An investor contributed $1.00$ USDC ($10,000,000$ base units with 7 decimals) to a $1,000.00$ USDC pool ($10^{10}$ base units).
 - The borrower defaults; after liquidation, a secondary recovery tranche of $1.00$ USDC is recovered.
 - The investor's mathematical pro-rata entitlement is:
   $$\text{Payout} = \frac{10^7}{10^{10}} \times 10^7 = 10,000 \text{ base units} = 0.001 \text{ USDC}$$
 
-### The Soroban Resource Fee Barrier & Rational Abandonment
-A Soroban transaction invoking `claim_return` or `claim_secondary_recovery` incurs base resource metering:
-- **Base Inclusion Fee:** 100,000 stroops (0.01 XLM).
-- **Resource Fee (Inclusion, CPU, Memory, Storage Footprint Read/Write):** typically 0.010 to 0.048 XLM (~$0.001 to $0.005 USD).
-- **If State Restoration is Required (Protocol 23):** restoring an archived persistent entry costs rent proportional to entry byte-size and restoration ledger count.
+### Stellar Network Fee Mechanics (CAP-0005) & Resource Metering
+A Soroban transaction invoking `claim_return` or `claim_secondary_recovery` incurs fees across two distinct dimensions:
+- **Base Network Inclusion Fee:** Minimum network inclusion fee is **100 stroops per operation** (0.00001 XLM) under Stellar Core consensus (CAP-0005). To ensure rapid transaction inclusion without queue starvation during network congestion, the keeper daemon bids up to **100,000 stroops** (0.01 XLM).
+- **Soroban Resource Fee (Inclusion, CPU, Memory, Storage Footprint Read/Write):** Typically 0.010 to 0.048 XLM (~$0.001 to $0.005 USD at $1\text{ XLM} \approx \$0.10\text{ USD}$).
+- **State Restoration (Protocol 23 / CAP-0066):** Restoring an archived persistent entry costs rent proportional to entry byte-size and restoration ledger count.
 
-If an individual contributor must sign, submit, and pay fees to recover $0.001 USDC, the gas cost exceeds the balance, causing **rational fund abandonment**.
+If an individual contributor must independently submit and pay gas fees of ~$0.001 to $0.005 USD to claim $0.001 USDC, transaction gas exceeds recovered funds, creating **rational fund abandonment**.
 
 ---
 
-## 2. Protocol Resolution Architecture
+## 2. Mathematical Rounding Error Bound under Discrete Tranche Telescoping
 
-Kallpa implements an end-to-end multi-tier mitigation:
+Under discrete tranche telescoping, each tranche $k$ of recovered amount $S_k$ is allocated to investor position $i$ with cumulative contribution window $[cum\_prior_i, cum\_after_i]$ (where $cum\_after_i - cum\_prior_i = p_i$, and $\sum_i p_i = T$):
+
+$$P_{i,k} = \left\lfloor \frac{cum\_after_i \cdot S_k}{T} \right\rfloor - \left\lfloor \frac{cum\_prior_i \cdot S_k}{T} \right\rfloor$$
+
+### Theorem 1 (Exact Global Conservation):
+$$\sum_{i=1}^N P_{i,k} = \left\lfloor \frac{cum\_after_N \cdot S_k}{T} \right\rfloor - \left\lfloor \frac{cum\_prior_1 \cdot S_k}{T} \right\rfloor = \left\lfloor \frac{T \cdot S_k}{T} \right\rfloor - 0 = S_k$$
+Every single stroop is 100% conserved with zero residual locked in the contract and zero overpayment deficit.
+
+### Theorem 2 (Strict Non-Negative Monotonicity):
+Because $cum\_after_i \ge cum\_prior_i$, $cum\_after_i \cdot S_k \ge cum\_prior_i \cdot S_k \ge 0$, and the floor function is monotonic non-decreasing:
+$$P_{i,k} \ge 0 \quad \forall i, k$$
+Negative payouts or claiming deficit insolvency are mathematically impossible.
+
+### Theorem 3 (Accumulated Rounding Error Bound under Tranche Fragmentation):
+Let $E_i^{ideal}(S_{total}) = \frac{p_i}{T} \sum_{k=1}^K S_k$ be the unrounded theoretical pro-rata entitlement across $K$ tranches.
+Because for any real number $x$, $x - 1 < \lfloor x \rfloor \le x$, the error per individual tranche allocation is strictly bounded by:
+$$-1 < P_{i,k} - \frac{p_i \cdot S_k}{T} < 1$$
+Summing across $K$ discrete tranches:
+$$\left| \sum_{k=1}^K P_{i,k} - E_i^{ideal} \right| < K \text{ stroops}$$
+
+### Economic Interpretation of the Rounding Bound:
+- 1 stroop of USDC ($10^{-7}$ USDC) = $\$0.0000001$ USD.
+- Across $K = 100$ tranches, the maximum accumulated truncation deviation for any position is bounded by:
+  $$\Delta < 100 \text{ stroops} = 0.00001 \text{ USDC} = \$0.00001 \text{ USD}$$
+- **Micro-Truncation Threshold:** An individual recovery produces $P_{i,k} = 0$ stroops if and only if:
+  $$\frac{p_i}{T} S_k < 1 \text{ stroop} = 10^{-7} \text{ USDC}$$
+  In standard SME loan pools ($T = \$10,000$ to $\$100,000$ USDC, $10^{11}$ to $10^{12}$ stroops) with minimum contribution $p_i \ge 1$ USDC ($10^7$ stroops), any tranche $S_k \ge 1$ USDC ($10^7$ stroops) yields:
+  $$P_{i,k} \ge \left\lfloor \frac{10^7 \times 10^7}{10^{12}} \right\rfloor = 100 \text{ stroops} > 0$$
+  Truncation to 0 stroops only occurs in extreme synthetic scenarios ($T \ge \$100\text{M}$ USDC with micro-recoveries of $\$1.00$ USDC). Even in such extreme edge cases, cumulative truncation remains strictly bounded by $K$ stroops ($\le \$0.00001$ USD across 100 tranches).
+
+---
+
+## 3. Protocol Resolution Architecture & Viability Matrix
+
+Kallpa eliminates rational abandonment through a 5-tier architecture:
 
 ### Tier 1: Upstream Pool Viability Guard & Consensus Ticket Sizing
 - `min_contribution`: The contract consensus strictly enforces $min\_contribution \ge MIN\_RECOVERY\_TRANCHE = 10,000,000$ base units (1.0 USDC with 7 decimals).
@@ -36,32 +70,46 @@ Kallpa implements an end-to-end multi-tier mitigation:
 - Bounded batch claims (`max_tranches: Option<u32>`) process up to 50 tranches in a single contract invocation, amortizing resource fees across all tranches.
 - Any residual left in the secondary buffer after a default can be flushed via `flush_secondary_buffer` with a 24-hour cooldown (`FLUSH_COOLDOWN_SECONDS`), preventing permanent token lockups.
 
-### Tier 3: Permissionless Disbursal Pattern (Zero Beneficiary Auth)
+### Tier 3: Non-Custodial Terminal Pool Closure (`close_pool`)
+- Admin can close settled/disputed pools immediately.
+- **Permissionless Liveness Valve:** If admin disappears or becomes unresponsive, any participant (investor, keeper, relayer) can call `close_pool` permissionlessly strictly after 30 days past `repayment_deadline`.
+- Materializes any remaining buffer into terminal tranches within bounded per-call budget ($\le 10$ tranches), permanently freezing the tranche creation horizon.
+- Unallocated direct transfers after closure can still be recovered via `reconcile_incoming_balance`, guaranteeing zero trapped funds.
+
+### Tier 4: Permissionless Disbursal Pattern (Zero Beneficiary Auth)
 - `claim_return(investor)`, `refund(investor)`, and `claim_secondary_recovery(investor, max_tranches)` do NOT require caller authorization from `investor`.
-- Transfer invariant: Tokens are immutably and strictly transferred to `&investor` (the position key owner), never to `env.invoker()` or any arbitrary address.
+- Transfer invariant: Tokens are immutably and strictly transferred to `&investor` (the position key owner), never to `caller`.
 - **Result:** Any entity (a community keeper, protocol relayer, or DAO bot) can batch-execute and disburse claims to hundreds of users without requiring user signatures or private keys.
 
-### Tier 4: Autonomous Keeper Daemon & Dual Fee Accounting Engine
-To eliminate user friction, the **Autonomous Keeper Daemon** (`@kallpa/keeper`) operates continuously:
-1. **Operator:** Open-source TypeScript daemon operating against standard Soroban RPC.
-2. **Canonical Solvency Verification:**
-   - Computes available balance using canonical Stellar Core reserve math:
-     $$\text{available} = \text{balance} - ((2 + \text{numSubEntries} + \text{numSponsoring} - \text{numSponsored}) \times \text{baseReserve} + \text{sellingLiabilities})$$
-3. **Dual Accounting (Maximum Envelope Commitment vs Exact On-Chain Fee Charged):**
-   - **Pre-Flight Ceiling Reservation:** Before submitting any envelope (restoration or invocation), the daemon computes the definitive envelope maximum fee (`tx.fee`) and validates that:
-     $$\text{totalCommittedFee} + \text{definitiveEnvelopeFee} \le \text{remainingBudget}$$
-   - **Post-Confirmation Reconciliation:** Once `getTransaction` confirms `SUCCESS` or `FAILED`, the daemon parses `resultXdr.feeCharged()` from the transaction result XDR and records the exact effective fee charged, preventing fee leakage on both successful and reverted on-chain transactions.
-   - **Hermetic Restoration Commitment Protection:** If a restoration transaction is confirmed on-chain, all downstream checks (including post-restoration sequence re-fetching, re-simulation, envelope assembly, pre-flight remaining budget verification, and post-restoration `checkSponsorSolvency()`) are wrapped in a hermetic error boundary that unconditionally carries `err.committedFeeStroops = totalCommittedFee` and `err.effectiveFeeStroops = totalEffectiveFee`. This guarantees that committed restoration fees are never leaked if downstream RPC or network failures occur.
-4. **Intelligent Subsidization & Cursor Progression:**
-   - **Tranche-Level Subsidy Bounding:** Subsidization is bounded at the individual tranche level (`maxZeroPayoutTranchesPerCycle`, default 100), accurately tracking the exact number of tranches advanced per batch rather than crude transaction counts.
-   - **Ternary Claim Classification (`Positive | Zero | Unknown`):** The daemon evaluates claim payouts via `isClaimZeroPayout` returning a strict ternary `ClaimPayoutType`. If simulation fails or encounters an RPC transport error, the claim is classified as `Unknown` rather than optimistically presumed `Positive`. When the zero-payout subsidy budget is exhausted, `Zero` and `Unknown` claims are safely deferred without sponsoring unverified transactions.
-   - **Non-Blocking Sweep Progression:** The keeper never terminates or stalls an entire sweep when the zero-payout threshold is reached: it evaluates each subsequent investor individually, instantly dispatching positive payouts without blocking or griefing the cycle.
+### Tier 5: Autonomous Keeper Daemon (`@kallpa/keeper`)
+- **Durable Write-Ahead Logging (WAL):** Mandatory storage persistence across reboots. Reservations recorded to disk before network dispatch; cleaned only upon confirmed on-chain execution or proved ledger expiration.
+- **Ledger-Aware Expiration:** Expiration determined strictly by `getLatestLedger().closeTime > validUntilTime`, never local wall-clock time.
+- **Strict Uncertainty Preservation:** Unconfirmed submissions retain status as pending reservations; committed fee distinguished from effective fee charged.
 
 ---
 
-## 3. Measured Resource Metering Benchmarks (Protocol 28 & Host Environment)
+## 4. Economic Break-Even Viability Matrix
 
-The Soroban budget metering for `claim_secondary_recovery` was empirically benchmarked in the contract regression test suite across batch sizes 1, 25, and 50 (capped at 50 tranches by protocol invariant):
+For an individual micro-investor with contribution $p$ in a pool of size $T$, reclaiming $K$ tranches of total recovery $A$ is economically viable if the recovered amount exceeds the execution gas cost $C_{gas}$:
+
+$$\frac{p}{T} A \ge C_{gas}$$
+
+| Investor Ticket $p$ | Pool Size $T$ | Pro-Rata Share $\frac{p}{T}$ | Total Recovery $A$ | Gross Recovery Payout | Self-Claim Gas Cost (1 tx) | Net Payout (Self-Claim) | Keeper Disbursed (Zero User Cost) |
+|---|---|---|---|---|---|---|---|
+| **$1.00 USDC** | $10,000 USDC | 0.01% (100 bps) | $50.00 USDC | **$0.005 USDC** | ~$0.003 USD | +$0.002 USDC | **+$0.005 USDC (100% net)** |
+| **$1.00 USDC** | $50,000 USDC | 0.002% (20 bps) | $50.00 USDC | **$0.001 USDC** | ~$0.003 USD | -$0.002 USD (Unviable) | **+$0.001 USDC (100% net)** |
+| **$10.00 USDC** | $50,000 USDC | 0.02% (200 bps) | $100.00 USDC | **$0.020 USDC** | ~$0.003 USD | +$0.017 USDC | **+$0.020 USDC (100% net)** |
+| **$50.00 USDC** | $50,000 USDC | 0.10% (1000 bps) | $500.00 USDC | **$0.500 USDC** | ~$0.003 USD | +$0.497 USDC | **+$0.500 USDC (100% net)** |
+
+### Conclusion:
+- For tickets $\ge \$10.00$ USDC, self-claiming is strictly profitable even on modest default recoveries.
+- For micro-tickets ($1.00$ to $5.00$ USDC) in large pools, self-claiming faces rational abandonment. Kallpa's **Permissionless Disbursal Pattern + Keeper Daemon** solves this completely by subsidizing micro-claims, delivering 100% of the entitlement directly to the user's wallet with zero user gas expenditure.
+
+---
+
+## 5. Measured Resource Metering Benchmarks (Protocol 28 & Host Environment)
+
+The Soroban budget metering for `claim_secondary_recovery` was empirically benchmarked across batch sizes 1, 25, and 50 (capped at 50 tranches by protocol invariant):
 
 | Batch Size (Tranches) | CPU Instructions Consumed | Memory Bytes Consumed | Soroban CPU Limit | Soroban Memory Limit | % CPU Headroom | % Memory Headroom |
 |---|---|---|---|---|---|---|
@@ -73,7 +121,7 @@ Even at the maximum batch size of 50 tranches with state storage updates, the in
 
 ---
 
-## 4. Protocol 23 & CAP-0066 State Archival & Auto-Restoration Economics
+## 6. Protocol 23 & CAP-0066 State Archival & Auto-Restoration Economics
 
 ### Exact Ledger Lifetimes
 - **Instance Storage (`DataKey::Config`, `State`, `TotalCollected`, etc.):**

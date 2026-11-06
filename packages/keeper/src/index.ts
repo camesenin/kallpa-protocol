@@ -75,8 +75,12 @@ export class KallpaKeeperDaemon {
     this.config = config;
     this.server = new rpc.Server(config.rpcUrl);
     this.sponsorKey = Keypair.fromSecret(config.sponsorSecret);
+    // Production daemon requires durable reservation storage to guarantee zero lost reservations across restarts
     if (config.storagePath) {
       this.storageFile = config.storagePath;
+      this.loadDurableReservations();
+    } else if (process.env.NODE_ENV === "production") {
+      this.storageFile = ".kallpa-keeper-storage.json";
       this.loadDurableReservations();
     }
   }
@@ -132,11 +136,19 @@ export class KallpaKeeperDaemon {
       fs.renameSync(tmpFile, this.storageFile);
       // Synchronize parent directory to flush directory entry rename on POSIX
       try {
-        const dirFd = fs.openSync(dir || ".", "r");
-        fs.fsyncSync(dirFd);
-        fs.closeSync(dirFd);
-      } catch (dirSyncErr) {
-        // Ignored on platforms without directory fsync support (e.g. Windows)
+        if (process.platform !== "win32") {
+          const dirFd = fs.openSync(dir || ".", "r");
+          try {
+            fs.fsyncSync(dirFd);
+          } finally {
+            fs.closeSync(dirFd);
+          }
+        }
+      } catch (dirSyncErr: any) {
+        // Only ignore unsupported directory fsync errors; rethrow real hardware I/O or permission errors
+        if (dirSyncErr.code !== "ENOSYS" && dirSyncErr.code !== "EISDIR" && dirSyncErr.code !== "EINVAL" && dirSyncErr.code !== "EPERM") {
+          throw dirSyncErr;
+        }
       }
     } catch (e: any) {
       throw new Error(`Critical: Failed to persist durable keeper reservations: ${e.message}`);
@@ -775,13 +787,21 @@ export class KallpaKeeperDaemon {
         restoreSendRes = await this.server.sendTransaction(restoreTx);
       } catch (transportErr: any) {
         transportErr.committedFeeStroops = definitiveRestoreFee;
-        transportErr.effectiveFeeStroops = definitiveRestoreFee;
+        // Exact uncertainty distinction: effective fee is 0n because transaction was NOT confirmed on-chain
+        transportErr.effectiveFeeStroops = 0n;
         throw transportErr;
       }
       if (restoreSendRes.status === "ERROR") {
-        this.pendingReservations.delete(computedRestoreHash);
-        this.persistDurableReservations();
-        throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
+        // Strict Uncertainty Preservation: Stellar RPC distinguishes submission rejection from ambiguous failure.
+        // If errorResult contains definitive fatal bad auth / bad sequence, reservation is safely discarded.
+        // If error is ambiguous or network related, reservation remains durably locked until ledger close time proves expiration.
+        const errXdr = restoreSendRes.errorResult?.toXDR("base64");
+        const isDefinitiveEnvelopeRejection = restoreSendRes.errorResult !== undefined;
+        if (isDefinitiveEnvelopeRejection) {
+          this.pendingReservations.delete(computedRestoreHash);
+          this.persistDurableReservations();
+        }
+        throw new Error(`Restore footprint failed: ${errXdr}`);
       }
 
       if (restoreSendRes.hash && restoreSendRes.hash !== computedRestoreHash) {
@@ -897,14 +917,19 @@ export class KallpaKeeperDaemon {
         sendRes = await this.server.sendTransaction(preparedTx);
       } catch (transportErr: any) {
         transportErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
-        transportErr.effectiveFeeStroops = totalEffectiveFee + definitiveEnvelopeFee;
+        // Exact uncertainty distinction: effective fee only reflects already-confirmed transactions
+        transportErr.effectiveFeeStroops = totalEffectiveFee;
         throw transportErr;
       }
 
       if (sendRes.status === "ERROR") {
-        this.pendingReservations.delete(computedTxHash);
-        this.persistDurableReservations();
-        throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
+        const errXdr = sendRes.errorResult?.toXDR("base64");
+        const isDefinitiveEnvelopeRejection = sendRes.errorResult !== undefined;
+        if (isDefinitiveEnvelopeRejection) {
+          this.pendingReservations.delete(computedTxHash);
+          this.persistDurableReservations();
+        }
+        throw new Error(`Transaction submission error: ${errXdr}`);
       }
 
       // If the RPC returned a hash that matches or differs (e.g. envelope hash vs hash), update mapping

@@ -858,11 +858,16 @@ impl KallpaPoolContract {
             .get(&DataKey::Config)
             .ok_or(Error::NotInitialized)?;
 
-        // Only admin can finalize and close the pool
-        if caller != config.admin {
+        caller.require_auth();
+
+        let now = env.ledger().timestamp();
+        let is_admin = caller == config.admin;
+        let is_permissionless_time_lapsed = now > config.repayment_deadline.saturating_add(30 * 86400);
+
+        // Either admin initiates closure OR 30-day grace period past repayment_deadline has elapsed
+        if !is_admin && !is_permissionless_time_lapsed {
             return Err(Error::Unauthorized);
         }
-        caller.require_auth();
 
         let state: PoolState = env
             .storage()
