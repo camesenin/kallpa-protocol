@@ -671,8 +671,12 @@ impl KallpaPoolContract {
             return Err(Error::BatchLimitExceeded);
         }
 
-        let start = position.claimed_tranches + 1;
-        let end = (position.claimed_tranches + requested_batch).min(total_tranches);
+        let start = position.claimed_tranches.checked_add(1).ok_or(Error::CapacityExceeded)?;
+        let end = position
+            .claimed_tranches
+            .checked_add(requested_batch)
+            .ok_or(Error::CapacityExceeded)?
+            .min(total_tranches);
 
         let mut total_payout: i128 = 0;
         for tranche_idx in start..=end {
@@ -863,15 +867,19 @@ impl KallpaPoolContract {
         // This guarantees that any direct SEP-41 transfer or late TW escrow refund is fully recognized.
         Self::internal_reconcile_surplus(&env, &config, state)?;
 
-        // Materialize any remaining buffer using record_secondary_tranche logic, strictly respecting MAX_MONETARY_CAP!
-        // If pending buffer remains (> 0), it must be flushed in bounded slices of MAX_MONETARY_CAP.
+        // Materialize buffer incrementally strictly bounded by MAX_TRANCHES_PER_TX (10) per invocation!
+        // This guarantees that close_pool() is strictly bounded in CPU and memory metering.
+        // If pending balance exceeds 10 slices, close_pool materializes the first 10 slices,
+        // records remaining balance in PendingSecondaryBuffer, and caller must invoke close_pool again.
+        // The pool transitions to Closed ONLY once pending balance is completely materialized to 0!
         let mut pending: i128 = env
             .storage()
             .instance()
             .get(&DataKey::PendingSecondaryBuffer)
             .unwrap_or(0);
 
-        while pending > 0 {
+        let mut tranches_created = 0u32;
+        while pending > 0 && tranches_created < MAX_TRANCHES_PER_TX {
             let count: u32 = env
                 .storage()
                 .instance()
@@ -885,6 +893,7 @@ impl KallpaPoolContract {
             };
 
             pending = pending.checked_sub(tranche_amount).ok_or(Error::MathOverflow)?;
+            tranches_created = tranches_created.saturating_add(1);
 
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
             env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
@@ -901,9 +910,12 @@ impl KallpaPoolContract {
             env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
         }
 
-        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+        env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &pending);
 
-        env.storage().instance().set(&DataKey::State, &PoolState::Closed);
+        // Only transition to Closed once all pending buffer has been fully materialized!
+        if pending == 0 {
+            env.storage().instance().set(&DataKey::State, &PoolState::Closed);
+        }
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
     }

@@ -130,6 +130,14 @@ export class KallpaKeeperDaemon {
       fs.closeSync(fd);
       // Atomic rename guarantees crash-proof durable storage
       fs.renameSync(tmpFile, this.storageFile);
+      // Synchronize parent directory to flush directory entry rename on POSIX
+      try {
+        const dirFd = fs.openSync(dir || ".", "r");
+        fs.fsyncSync(dirFd);
+        fs.closeSync(dirFd);
+      } catch (dirSyncErr) {
+        // Ignored on platforms without directory fsync support (e.g. Windows)
+      }
     } catch (e: any) {
       throw new Error(`Critical: Failed to persist durable keeper reservations: ${e.message}`);
     }
@@ -268,11 +276,8 @@ export class KallpaKeeperDaemon {
         continue;
       }
 
-      // 2. Fallback timeout prune after 10m ONLY IF ledger time is unavailable
-      if (!networkCloseTime && now - reservation.timestamp > 600_000) {
-        this.pendingReservations.delete(txHash);
-        changed = true;
-      }
+      // 2. Strict Uncertainty Preservation: Never prune unconfirmed reservations without proof of expiration!
+      // In case of RPC outage or ledger stall, unconfirmed reservations remain strictly locked to prevent double-spending sponsor balance.
     }
     if (changed) {
       this.persistDurableReservations();
