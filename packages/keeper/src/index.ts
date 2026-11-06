@@ -457,6 +457,12 @@ export class KallpaKeeperDaemon {
         } catch (err: any) {
           console.error(`Failed disbursing ${target.action} for ${target.investor}:`, err);
           errors++;
+          // Strict Zero-Payout Subsidy Reservation on Uncertainty:
+          // If a secondary claim transaction fails, times out, or encounters RPC uncertainty after pre-flight quota reservation,
+          // conservatively deduct expectedBatchAdvancement from remaining quota to prevent subsequent claims from evading the quota.
+          if (target.action === "claim_secondary" && expectedBatchAdvancement > 0) {
+            confirmedZeroPayoutAdvancements += expectedBatchAdvancement;
+          }
           // If transaction committed fee before failure (or restoration occurred), account for committed fee
           if (err && typeof err.committedFeeStroops === "bigint") {
             totalCommittedFeeStroops += err.committedFeeStroops;
@@ -1120,13 +1126,14 @@ export class KallpaKeeperDaemon {
           throw new Error(`Transaction ${txHash} confirmation received past 45s deadline (took ${elapsed}ms)`);
         }
         if (res.status === "SUCCESS") {
-          let feeCharged = 0n;
-          if (res.resultXdr) {
-            try {
-              feeCharged = res.resultXdr.feeCharged().toBigInt();
-            } catch (e) {
-              feeCharged = BigInt(res.resultXdr.feeCharged().toString());
-            }
+          if (!res.resultXdr) {
+            throw new Error(`Transaction ${txHash} confirmed with SUCCESS but resultXdr is missing from RPC response; effective fee cannot be verified`);
+          }
+          let feeCharged: bigint;
+          try {
+            feeCharged = res.resultXdr.feeCharged().toBigInt();
+          } catch (e) {
+            feeCharged = BigInt(res.resultXdr.feeCharged().toString());
           }
           return {
             effectiveFeeCharged: feeCharged,
