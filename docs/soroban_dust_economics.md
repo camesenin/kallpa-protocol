@@ -24,18 +24,19 @@ If an individual contributor must independently submit and pay gas fees of ~$0.0
 
 ## 2. Mathematical Rounding Error Bound under Discrete Tranche Telescoping
 
-Under discrete tranche telescoping, each tranche $k$ of recovered amount $S_k$ is allocated to investor position $i$ with cumulative contribution window $[cum\_prior_i, cum\_after_i]$ (where $cum\_after_i - cum\_prior_i = p_i$, and $\sum_i p_i = T$):
+Under discrete tranche telescoping, each tranche $k$ of recovered amount $S_k$ is allocated to investor position $i$ with cumulative contribution window $[c_{i-1}, c_i]$ (where $c_i - c_{i-1} = p_i$, and $\sum p_i = T$):
 
-$$P_{i,k} = \left\lfloor \frac{cum\_after_i \cdot S_k}{T} \right\rfloor - \left\lfloor \frac{cum\_prior_i \cdot S_k}{T} \right\rfloor$$
+$$P_{i,k} = \left\lfloor \frac{c_i \cdot S_k}{T} \right\rfloor - \left\lfloor \frac{c_{i-1} \cdot S_k}{T} \right\rfloor$$
 
 ### Theorem 1 (Exact Global Conservation):
-$$\sum_{i=1}^N P_{i,k} = \left\lfloor \frac{cum\_after_N \cdot S_k}{T} \right\rfloor - \left\lfloor \frac{cum\_prior_1 \cdot S_k}{T} \right\rfloor = \left\lfloor \frac{T \cdot S_k}{T} \right\rfloor - 0 = S_k$$
+$$\sum_{i=1}^N P_{i,k} = \left\lfloor \frac{c_N \cdot S_k}{T} \right\rfloor - \left\lfloor \frac{c_0 \cdot S_k}{T} \right\rfloor = \left\lfloor \frac{T \cdot S_k}{T} \right\rfloor - 0 = S_k$$
 Every single stroop is 100% conserved with zero residual locked in the contract and zero overpayment deficit.
 
-### Theorem 2 (Strict Non-Negative Monotonicity):
-Because $cum\_after_i \ge cum\_prior_i$, $cum\_after_i \cdot S_k \ge cum\_prior_i \cdot S_k \ge 0$, and the floor function is monotonic non-decreasing:
+### Theorem 2 (Monotonically Non-Decreasing Cumulative Entitlement):
+Because $c_i \ge c_{i-1}$, $c_i \cdot S_k \ge c_{i-1} \cdot S_k \ge 0$, and the integer floor function is monotonic non-decreasing:
 $$P_{i,k} \ge 0 \quad \forall i, k$$
 Negative payouts or claiming deficit insolvency are mathematically impossible.
+> **Note on Non-Decreasing vs Strict Monotonicity:** Entitlement growth is **monotonically non-decreasing**, not strictly positive on every recovery, because integer truncation may yield $P_{i,k} = 0$ stroops when an incremental recovery is small relative to $T/p_i$.
 
 ### Theorem 3 (Accumulated Rounding Error Bound under Tranche Fragmentation):
 Let $E_i^{ideal}(S_{total}) = \frac{p_i}{T} \sum_{k=1}^K S_k$ be the unrounded theoretical pro-rata entitlement across $K$ tranches.
@@ -44,55 +45,33 @@ $$-1 < P_{i,k} - \frac{p_i \cdot S_k}{T} < 1$$
 Summing across $K$ discrete tranches:
 $$\left| \sum_{k=1}^K P_{i,k} - E_i^{ideal} \right| < K \text{ stroops}$$
 
-### Economic Interpretation of the Rounding Bound:
-- 1 stroop of USDC ($10^{-7}$ USDC) = $\$0.0000001$ USD.
-- Across $K = 100$ tranches, the maximum accumulated truncation deviation for any position is bounded by:
-  $$\Delta < 100 \text{ stroops} = 0.00001 \text{ USDC} = \$0.00001 \text{ USD}$$
-- **Micro-Truncation Threshold:** An individual recovery produces $P_{i,k} = 0$ stroops if and only if:
-  $$\frac{p_i}{T} S_k < 1 \text{ stroop} = 10^{-7} \text{ USDC}$$
-  In standard SME loan pools ($T = \$10,000$ to $\$100,000$ USDC, $10^{11}$ to $10^{12}$ stroops) with minimum contribution $p_i \ge 1$ USDC ($10^7$ stroops), any tranche $S_k \ge 1$ USDC ($10^7$ stroops) yields:
-  $$P_{i,k} \ge \left\lfloor \frac{10^7 \times 10^7}{10^{12}} \right\rfloor = 100 \text{ stroops} > 0$$
-  Truncation to 0 stroops only occurs in extreme synthetic scenarios ($T \ge \$100\text{M}$ USDC with micro-recoveries of $\$1.00$ USDC). Even in such extreme edge cases, cumulative truncation remains strictly bounded by $K$ stroops ($\le \$0.00001$ USD across 100 tranches).
+### Mathematical Properties: Order Independence vs Fragmentation Variance:
+- **Order Independence:** For a fixed set of tranches $\{S_1, S_2, \dots, S_K\}$, the total payout $\sum_{k=1}^K P_{i,k}$ is strictly independent of the order in which tranches are materialized or claimed.
+- **Fragmentation Variance:** Because integer floor is non-linear, fragmenting a single large recovery $S$ into $M$ sub-tranches $\sum_{j=1}^M s_j = S$ can alter individual payouts by at most $M$ stroops, though total funds across all investors remain exactly conserved ($\sum_i P_{i,j} = s_j$).
+- **Zero-Payout Condition:** $P_{i,k} = 0$ occurs when $\lfloor c_i S_k / T \rfloor = \lfloor c_{i-1} S_k / T \rfloor$. While $\frac{p_i S_k}{T} < 1$ is a necessary condition for a zero payout, the exact realization depends on interval boundary alignment relative to integer multiples of $T$. Residual flushes (`flush_secondary_buffer` or `close_pool`) can materialize amounts $< MIN\_RECOVERY\_TRANCHE$, meaning zero increments can occur even in smaller pools. In all cases, deviation is bounded by $< K$ stroops.
 
 ---
 
-## 3. Protocol Resolution Architecture & Viability Matrix
+## 3. Protocol Lifecycle & Non-Custodial Terminal Pool Closure (`close_pool`)
 
-Kallpa eliminates rational abandonment through a 5-tier architecture:
-
-### Tier 1: Upstream Pool Viability Guard & Consensus Ticket Sizing
-- `min_contribution`: The contract consensus strictly enforces $min\_contribution \ge MIN\_RECOVERY\_TRANCHE = 10,000,000$ base units (1.0 USDC with 7 decimals).
-- Viability Guard: Every deposit must either fill the pool (`remaining_after == 0`) or leave at least `min_contribution` (`remaining_after >= min_contribution`).
-- Prevents sub-minimum stranded pool capacity.
-
-### Tier 2: Aggregated Recovery Tranching (`MIN_RECOVERY_TRANCHE`)
-- Secondary and dispute recoveries are aggregated in an internal buffer until reaching $\ge 1.0\text{ USDC}$ (`MIN_RECOVERY_TRANCHE`), preventing fragmentation of the global state into thousands of micro-ledgers.
-- Bounded batch claims (`max_tranches: Option<u32>`) process up to 50 tranches in a single contract invocation, amortizing resource fees across all tranches.
-- Any residual left in the secondary buffer after a default can be flushed via `flush_secondary_buffer` with a 24-hour cooldown (`FLUSH_COOLDOWN_SECONDS`), preventing permanent token lockups.
-
-### Tier 3: Non-Custodial Terminal Pool Closure (`close_pool`)
-- Admin can close settled/disputed pools immediately.
-- **Permissionless Liveness Valve:** If admin disappears or becomes unresponsive, any participant (investor, keeper, relayer) can call `close_pool` permissionlessly strictly after 30 days past `repayment_deadline`.
-- Materializes any remaining buffer into terminal tranches within bounded per-call budget ($\le 10$ tranches), permanently freezing the tranche creation horizon.
-- Unallocated direct transfers after closure can still be recovered via `reconcile_incoming_balance`, guaranteeing zero trapped funds.
-
-### Tier 4: Permissionless Disbursal Pattern (Zero Beneficiary Auth)
-- `claim_return(investor)`, `refund(investor)`, and `claim_secondary_recovery(investor, max_tranches)` do NOT require caller authorization from `investor`.
-- Transfer invariant: Tokens are immutably and strictly transferred to `&investor` (the position key owner), never to `caller`.
-- **Result:** Any entity (a community keeper, protocol relayer, or DAO bot) can batch-execute and disburse claims to hundreds of users without requiring user signatures or private keys.
-
-### Tier 5: Autonomous Keeper Daemon (`@kallpa/keeper`)
-- **Durable Write-Ahead Logging (WAL):** Mandatory storage persistence across reboots. Reservations recorded to disk before network dispatch; cleaned only upon confirmed on-chain execution or proved ledger expiration.
-- **Ledger-Aware Expiration:** Expiration determined strictly by `getLatestLedger().closeTime > validUntilTime`, never local wall-clock time.
-- **Strict Uncertainty Preservation:** Unconfirmed submissions retain status as pending reservations; committed fee distinguished from effective fee charged.
+### Lifecycle States and Terminal Settlement Horizon:
+1. **Open / Funded:** Active pool fundraising and loan disbursement.
+2. **Settled / Disputed:** Primary loan lifecycle completed (settled via repayment or defaulted to dispute recovery).
+3. **Closed (Terminal Horizon):**
+   - The admin can execute `close_pool` in Settled/Disputed state.
+   - **Permissionless Non-Custodial Liveness Valve:** If the admin becomes unresponsive or abandons the pool, any participant (investor, keeper, relayer) can call `close_pool` permissionlessly strictly after 30 days past `repayment_deadline`.
+   - **Bounded Progress:** At closure, any pending secondary buffer balance is materialized into discrete tranches subject to the shared per-tx budget ($r + f \le 10$). Once `PendingSecondaryBuffer == 0`, the pool state transitions to `Closed`.
+   - **Post-Closure Token Safety Valve:** `reconcile_incoming_balance` is permitted in `Closed` state exclusively as an emergency non-confiscation mechanism to recover direct, uncoordinated SEP-41 token transfers without locking funds. In standard protocol operations without external direct transfers, the tranche horizon is strictly bounded and finite.
 
 ---
 
-## 4. Economic Break-Even Viability Matrix
+## 4. Economic Break-Even Viability Matrix & Keeper Subsidies
 
-For an individual micro-investor with contribution $p$ in a pool of size $T$, reclaiming $K$ tranches of total recovery $A$ is economically viable if the recovered amount exceeds the execution gas cost $C_{gas}$:
+For an individual micro-investor with contribution $p$ in a pool of size $T$, self-claiming $K$ tranches of total recovery $A$ is economically viable if the recovered amount exceeds the execution gas cost $C_{gas}$:
 
 $$\frac{p}{T} A \ge C_{gas}$$
+
+Crucially, in Soroban, `claim_secondary_recovery(investor, max_tranches)` processes up to 50 tranches **for a single investor**, amortizing transaction gas across those 50 tranches. However, reclaiming across $N$ distinct investors requires $N$ separate contract invocations:
 
 | Investor Ticket $p$ | Pool Size $T$ | Pro-Rata Share $\frac{p}{T}$ | Total Recovery $A$ | Gross Recovery Payout | Self-Claim Gas Cost (1 tx) | Net Payout (Self-Claim) | Keeper Disbursed (Zero User Cost) |
 |---|---|---|---|---|---|---|---|
@@ -101,9 +80,11 @@ $$\frac{p}{T} A \ge C_{gas}$$
 | **$10.00 USDC** | $50,000 USDC | 0.02% (200 bps) | $100.00 USDC | **$0.020 USDC** | ~$0.003 USD | +$0.017 USDC | **+$0.020 USDC (100% net)** |
 | **$50.00 USDC** | $50,000 USDC | 0.10% (1000 bps) | $500.00 USDC | **$0.500 USDC** | ~$0.003 USD | +$0.497 USDC | **+$0.500 USDC (100% net)** |
 
-### Conclusion:
-- For tickets $\ge \$10.00$ USDC, self-claiming is strictly profitable even on modest default recoveries.
-- For micro-tickets ($1.00$ to $5.00$ USDC) in large pools, self-claiming faces rational abandonment. Kallpa's **Permissionless Disbursal Pattern + Keeper Daemon** solves this completely by subsidizing micro-claims, delivering 100% of the entitlement directly to the user's wallet with zero user gas expenditure.
+### Economic Interpretation & Finite Keeper Operation:
+- Self-claiming is economically rational whenever $\frac{p}{T} A > C_{gas}$ (e.g. larger tickets or significant recovery amounts).
+- For sub-economic micro-claims ($\frac{p}{T} A < C_{gas}$), individual self-claiming faces rational abandonment.
+- **Keeper Daemon Role:** `@kallpa/keeper` provides opportunistic public good subsidization bounded by `maxSweepBudgetStroops` and `maxZeroPayoutTranchesPerCycle`.
+- When keeper budget limits are reached, the daemon pauses cleanly without losing state. Unclaimed funds remain permanently available in immutable contract storage for users to claim directly whenever future recoveries make the aggregate entitlement economically viable.
 
 ---
 

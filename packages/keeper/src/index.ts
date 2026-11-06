@@ -460,7 +460,7 @@ export class KallpaKeeperDaemon {
           // If transaction committed fee before failure (or restoration occurred), account for committed fee
           if (err && typeof err.committedFeeStroops === "bigint") {
             totalCommittedFeeStroops += err.committedFeeStroops;
-            totalFeeSpentStroops += err.effectiveFeeStroops ?? err.committedFeeStroops;
+            totalFeeSpentStroops += typeof err.effectiveFeeStroops === "bigint" ? err.effectiveFeeStroops : 0n;
           }
         }
       }
@@ -827,7 +827,8 @@ export class KallpaKeeperDaemon {
         // Always preserve the maximum committed envelope fee for cycle budget safety,
         // but record the EXACT effective fee charged if extracted from FAILED transaction resultXdr!
         err.committedFeeStroops = definitiveRestoreFee;
-        err.effectiveFeeStroops = (err && typeof err.effectiveFeeCharged === "bigint") ? err.effectiveFeeCharged : definitiveRestoreFee;
+        // Exact uncertainty preservation: if transaction outcome or fee is unconfirmed/timeout, effective fee is strictly 0n (unknown)
+        err.effectiveFeeStroops = (err && typeof err.effectiveFeeCharged === "bigint") ? err.effectiveFeeCharged : 0n;
         this.persistDurableReservations();
         throw err;
       }
@@ -954,7 +955,8 @@ export class KallpaKeeperDaemon {
         this.persistDurableReservations();
       } catch (confirmErr: any) {
         confirmErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
-        confirmErr.effectiveFeeStroops = totalEffectiveFee + ((confirmErr && typeof confirmErr.effectiveFeeCharged === "bigint") ? confirmErr.effectiveFeeCharged : definitiveEnvelopeFee);
+        // Exact uncertainty preservation: only add confirmed effective fee; do NOT convert unconfirmed envelope fee into effective fee on timeout
+        confirmErr.effectiveFeeStroops = totalEffectiveFee + ((confirmErr && typeof confirmErr.effectiveFeeCharged === "bigint") ? confirmErr.effectiveFeeCharged : 0n);
         // Retain in pendingReservations across timeout so subsequent cycles deduct it
         this.persistDurableReservations();
         throw confirmErr;
