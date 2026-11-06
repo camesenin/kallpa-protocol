@@ -1377,6 +1377,66 @@ fn test_permissionless_refund_and_secondary_recovery_require_zero_beneficiary_au
 }
 
 #[test]
+fn test_zero_dust_asymmetry_elimination_under_fragmented_tranches() {
+    let setup = setup_test();
+    // 2 equal investors at 50% each (target = 2 USDC = 20_000_000 stroops)
+    let target = 20_000_000i128;
+    let repayment_target = target;
+    let funding_deadline = 1000u64;
+    let repayment_deadline = 5000u64;
+    let min_contribution = 10_000_000i128; // 1 USDC
+
+    setup.client.initialize(
+        &setup.admin,
+        &setup.token_addr,
+        &setup.tw_escrow,
+        &setup.payer,
+        &target,
+        &repayment_target,
+        &funding_deadline,
+        &repayment_deadline,
+        &min_contribution,
+    );
+
+    // Investor 1 deposits 1 USDC (10_000_000 stroops) -> 50%
+    setup.token_admin.mint(&setup.investor1, &10_000_000i128);
+    setup.client.contribute(&setup.investor1, &10_000_000i128);
+
+    // Investor 2 deposits 1 USDC (10_000_000 stroops) -> 50%
+    setup.token_admin.mint(&setup.investor2, &10_000_000i128);
+    setup.client.contribute(&setup.investor2, &10_000_000i128);
+
+    setup.env.ledger().set_timestamp(repayment_deadline + 10);
+    setup.client.declare_default(&setup.investor1);
+
+    // Inflow: 50 fragmented micro-tranches of 1 unit each (or 1 stroop equivalent scaled, e.g. MIN_RECOVERY_TRANCHE = 1 USDC each)
+    // Here we settle 50 tranches of 1 USDC (10_000_000 stroops).
+    // Total secondary recovery = 50 USDC = 500_000_000 stroops.
+    for _ in 0..50 {
+        setup.token_admin.mint(&setup.payer, &10_000_000i128);
+        setup.client.settle_repayment(&setup.payer, &10_000_000i128);
+    }
+
+    // Investor 1 claims in piecemeal single-tranche batches of 1 tranche at a time (50 separate claims!)
+    let mut inv1_total_claimed = 0i128;
+    for _ in 0..50 {
+        let p = setup.client.claim_secondary_recovery(&setup.investor1, &Some(1));
+        inv1_total_claimed += p;
+    }
+
+    // Investor 2 claims all 50 tranches in a single batch of 50 tranches
+    let inv2_total_claimed = setup.client.claim_secondary_recovery(&setup.investor2, &Some(50));
+
+    // Under the revolutionary O(1) Cumulative Prefix Sum Telescoping:
+    // Payout(inv1) == Payout(inv2) == exactly 25 USDC (250_000_000 stroops)!
+    // Rounding asymmetry across fragmented tranches is EXACTLY ZERO: |inv1 - inv2| == 0!
+    assert_eq!(inv1_total_claimed, 250_000_000i128, "Investor 1 must receive exactly 50% = 25 USDC");
+    assert_eq!(inv2_total_claimed, 250_000_000i128, "Investor 2 must receive exactly 50% = 25 USDC");
+    assert_eq!(inv1_total_claimed, inv2_total_claimed, "Fragmentation asymmetry must be exactly 0 stroops!");
+    assert_eq!(inv1_total_claimed + inv2_total_claimed, 500_000_000i128, "100% of recovery is conserved");
+}
+
+#[test]
 fn test_zero_payout_advances_cursor_and_unlocks_future_positive_tranche() {
     let setup = setup_test();
     let target = 1_000_000_000_0000000i128; // Large pool

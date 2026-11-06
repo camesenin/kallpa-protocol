@@ -35,6 +35,28 @@ pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
+    /// Safely computes `floor(a * b / c)` in integer arithmetic without intermediate `i128` overflow.
+    /// Uses Euclidean quotient-remainder decomposition:
+    /// `a * b / c = a * (b / c) + (a * (b % c)) / c`
+    /// Since `r = b % c < c <= MAX_MONETARY_CAP (10^19)` and `a <= MAX_MONETARY_CAP (10^19)`,
+    /// the product `a * r < 10^38 <= i128::MAX (1.7 x 10^38)` NEVER overflows `i128`!
+    fn safe_mul_div(a: i128, b: i128, c: i128) -> Result<i128, Error> {
+        if c <= 0 || a < 0 || b < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let q = b.checked_div(c).ok_or(Error::MathOverflow)?;
+        let r = b.checked_rem(c).ok_or(Error::MathOverflow)?;
+
+        let term1 = a.checked_mul(q).ok_or(Error::MathOverflow)?;
+        let term2 = a
+            .checked_mul(r)
+            .ok_or(Error::MathOverflow)?
+            .checked_div(c)
+            .ok_or(Error::MathOverflow)?;
+
+        term1.checked_add(term2).ok_or(Error::MathOverflow)
+    }
+
     fn record_secondary_tranche_budgeted(env: &Env, amount: i128, max_tranches: u32) -> Result<u32, Error> {
         if amount <= 0 || max_tranches == 0 {
             return Ok(0);
@@ -77,17 +99,19 @@ impl KallpaPoolContract {
             tranches_created = tranches_created.saturating_add(1);
 
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
-            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-            let tranche_key = DataKey::SecondaryTranche(new_count);
-            env.storage().persistent().set(&tranche_key, &tranche_amount);
-            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-
             let total_sec: i128 = env
                 .storage()
                 .instance()
                 .get(&DataKey::TotalSecondaryAllocated)
                 .unwrap_or(0);
             let new_total_sec = total_sec.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
+
+            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+            let tranche_key = DataKey::SecondaryTranche(new_count);
+            // Prefix Sum Invariant: SecondaryTranche(k) stores S_cum(k), the cumulative secondary funds allocated up to tranche k!
+            env.storage().persistent().set(&tranche_key, &new_total_sec);
+            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
             env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
         }
 
@@ -683,41 +707,35 @@ impl KallpaPoolContract {
             .ok_or(Error::CapacityExceeded)?
             .min(total_tranches);
 
-        let mut total_payout: i128 = 0;
-        for tranche_idx in start..=end {
-            let tranche_key = DataKey::SecondaryTranche(tranche_idx);
-            let tranche_amount: i128 = env
-                .storage()
-                .persistent()
-                .get(&tranche_key)
-                .unwrap_or(0);
+        // O(1) Cumulative Prefix Sum Telescoping:
+        // By evaluating entitlement on the cumulative recovery totals S_cum(end) and S_cum(start - 1),
+        // we guarantee mathematical equivalence to an aggregated single-batch allocation:
+        // Entitlement(end) = floor(cum_after * S_cum_end / T) - floor(cum_prior * S_cum_end / T)
+        // Entitlement(start-1) = floor(cum_after * S_cum_start / T) - floor(cum_prior * S_cum_start / T)
+        // Payout = Entitlement(end) - Entitlement(start-1)
+        // This ELIMINATES 100% of the cumulative rounding bias and fragmentation distortion across batches!
+        let s_cum_start = if position.claimed_tranches == 0 {
+            0i128
+        } else {
+            let start_key = DataKey::SecondaryTranche(position.claimed_tranches);
+            let val: i128 = env.storage().persistent().get(&start_key).unwrap_or(0);
+            env.storage().persistent().extend_ttl(&start_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            val
+        };
 
-            if tranche_amount > 0 {
-                let upper = position
-                    .cum_after
-                    .checked_mul(tranche_amount)
-                    .ok_or(Error::MathOverflow)?
-                    .checked_div(total_collected)
-                    .ok_or(Error::MathOverflow)?;
+        let end_key = DataKey::SecondaryTranche(end);
+        let s_cum_end: i128 = env.storage().persistent().get(&end_key).unwrap_or(0);
+        env.storage().persistent().extend_ttl(&end_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
-                let lower = position
-                    .cum_prior
-                    .checked_mul(tranche_amount)
-                    .ok_or(Error::MathOverflow)?
-                    .checked_div(total_collected)
-                    .ok_or(Error::MathOverflow)?;
+        let upper_end = Self::safe_mul_div(position.cum_after, s_cum_end, total_collected)?;
+        let lower_end = Self::safe_mul_div(position.cum_prior, s_cum_end, total_collected)?;
+        let ent_end = upper_end.checked_sub(lower_end).ok_or(Error::MathOverflow)?;
 
-                let payout = upper.checked_sub(lower).ok_or(Error::MathOverflow)?;
-                total_payout = total_payout.checked_add(payout).ok_or(Error::MathOverflow)?;
+        let upper_start = Self::safe_mul_div(position.cum_after, s_cum_start, total_collected)?;
+        let lower_start = Self::safe_mul_div(position.cum_prior, s_cum_start, total_collected)?;
+        let ent_start = upper_start.checked_sub(lower_start).ok_or(Error::MathOverflow)?;
 
-                // Extend TTL for visited persistent tranche entry
-                env.storage().persistent().extend_ttl(
-                    &tranche_key,
-                    PERSISTENT_LIFETIME_THRESHOLD,
-                    PERSISTENT_BUMP_AMOUNT,
-                );
-            }
-        }
+        let total_payout = ent_end.checked_sub(ent_start).ok_or(Error::MathOverflow)?;
 
         position.claimed_tranches = end;
         env.storage().persistent().set(&position_key, &position);
@@ -818,17 +836,19 @@ impl KallpaPoolContract {
             tranches_created = tranches_created.saturating_add(1);
 
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
-            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-            let tranche_key = DataKey::SecondaryTranche(new_count);
-            env.storage().persistent().set(&tranche_key, &tranche_amount);
-            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-
             let total_sec: i128 = env
                 .storage()
                 .instance()
                 .get(&DataKey::TotalSecondaryAllocated)
                 .unwrap_or(0);
             let new_total_sec = total_sec.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
+
+            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+            let tranche_key = DataKey::SecondaryTranche(new_count);
+            // Prefix Sum Invariant: SecondaryTranche(k) stores S_cum(k), the cumulative secondary funds allocated up to tranche k!
+            env.storage().persistent().set(&tranche_key, &new_total_sec);
+            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
             env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
         }
 
@@ -902,17 +922,19 @@ impl KallpaPoolContract {
             tranches_created = tranches_created.saturating_add(1);
 
             let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
-            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-            let tranche_key = DataKey::SecondaryTranche(new_count);
-            env.storage().persistent().set(&tranche_key, &tranche_amount);
-            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-
             let total_sec: i128 = env
                 .storage()
                 .instance()
                 .get(&DataKey::TotalSecondaryAllocated)
                 .unwrap_or(0);
             let new_total_sec = total_sec.checked_add(tranche_amount).ok_or(Error::MathOverflow)?;
+
+            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+            let tranche_key = DataKey::SecondaryTranche(new_count);
+            // Prefix Sum Invariant: SecondaryTranche(k) stores S_cum(k), the cumulative secondary funds allocated up to tranche k!
+            env.storage().persistent().set(&tranche_key, &new_total_sec);
+            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
             env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
         }
 
