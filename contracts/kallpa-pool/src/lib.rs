@@ -24,26 +24,18 @@ const MIN_RECOVERY_TRANCHE: i128 = 10_000_000i128; // 1.0 USDC (7 decimals)
 // Maximum tranches processed per paginated batch claim
 const MAX_BATCH_CLAIM_TRANCHES: u32 = 50;
 
-// Maximum secondary tranches materialized per transaction to strictly bound write footpint and metering
+// Maximum secondary tranches materialized per transaction to strictly bound write footprint and metering
 const MAX_TRANCHES_PER_TX: u32 = 10;
 
 // Minimum cooldown period (in seconds) between manual flush calls to prevent spamming micro-tranches
 const FLUSH_COOLDOWN_SECONDS: u64 = 86400; // 24 hours
-
-// Hard upper bound on total discrete secondary tranches over the entire lifetime of a pool.
-// This strictly caps the persistent storage footprint, state archival surface, and keeper claim cycles:
-// K <= MAX_SECONDARY_TRANCHES (exactly 100 tranches). Once reached, any further incoming late recovery
-// or residual flush merges directly into the 100th tranche, guaranteeing finite lifetime complexity.
-// In terms of batch claims (MAX_BATCH_CLAIM_TRANCHES = 50), any investor can claim all lifetime recoveries
-// in at most 2 batch transactions!
-pub const MAX_SECONDARY_TRANCHES: u32 = 100;
 
 #[contract]
 pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
-        fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
+    fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Ok(());
         }
@@ -64,9 +56,9 @@ impl KallpaPoolContract {
         }
 
         // Materialize discrete tranches strictly capped at MAX_MONETARY_CAP per tranche
-        // and bounded by MAX_TRANCHES_PER_TX to guarantee strict resource metering.
-        // Once SecondaryTrancheCount reaches MAX_SECONDARY_TRANCHES (50), no new discrete keys
-        // are created; all further incoming secondary funds accumulate directly into the 50th tranche.
+        // and bounded by MAX_TRANCHES_PER_TX to guarantee strict resource metering per transaction.
+        // Tranche keys are unbounded in persistent storage: every late repayment or external
+        // surplus is guaranteed to materialize without ceiling rejection, preventing trapped funds.
         let mut tranches_created = 0u32;
         while combined >= MIN_RECOVERY_TRANCHE && tranches_created < MAX_TRANCHES_PER_TX {
             let count: u32 = env
@@ -74,13 +66,6 @@ impl KallpaPoolContract {
                 .instance()
                 .get(&DataKey::SecondaryTrancheCount)
                 .unwrap_or(0);
-
-            if count >= MAX_SECONDARY_TRANCHES {
-                // Ceiling reached: pool is permanently finalized for secondary tranches.
-                // Any subsequent late recovery or dust remains in PendingSecondaryBuffer
-                // and cannot create further tranches beyond MAX_SECONDARY_TRANCHES (100).
-                break;
-            }
 
             let tranche_amount = if combined > MAX_MONETARY_CAP {
                 MAX_MONETARY_CAP
@@ -305,14 +290,6 @@ impl KallpaPoolContract {
         // If pool is already Settled or Disputed, any post-settlement repayment or late recovery
         // routes to a discrete immutable secondary tranche without altering frozen primary R.
         if state == PoolState::Settled || state == PoolState::Disputed {
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryTrancheCount)
-                .unwrap_or(0);
-            if count >= MAX_SECONDARY_TRANCHES {
-                return Err(Error::CapacityExceeded);
-            }
             token_client.transfer(&payer, &env.current_contract_address(), &amount);
             Self::record_secondary_tranche(&env, amount)?;
             env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -469,14 +446,6 @@ impl KallpaPoolContract {
             }
         } else {
             // Already Settled or Disputed: late dispute refund routes to discrete secondary tranche
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryTrancheCount)
-                .unwrap_or(0);
-            if count >= MAX_SECONDARY_TRANCHES {
-                return Err(Error::CapacityExceeded);
-            }
             Self::record_secondary_tranche(&env, amount)?;
         }
 
@@ -817,8 +786,8 @@ impl KallpaPoolContract {
         env.storage().instance().set(&DataKey::LastFlushTimestamp, &now);
 
         // Bounded materialization strictly respecting MAX_MONETARY_CAP per tranche and MAX_TRANCHES_PER_TX.
-        // Once SecondaryTrancheCount reaches MAX_SECONDARY_TRANCHES (50), no new discrete keys
-        // are created; all further flushed balance merges directly into the 50th terminal tranche.
+        // Each tranche is materialized in persistent storage without artificial ceiling,
+        // eliminating fund lockup.
         let mut total_flushed: i128 = 0;
         let mut tranches_created = 0u32;
 
@@ -828,13 +797,6 @@ impl KallpaPoolContract {
                 .instance()
                 .get(&DataKey::SecondaryTrancheCount)
                 .unwrap_or(0);
-
-            if count >= MAX_SECONDARY_TRANCHES {
-                // Ceiling reached: pool is permanently finalized for secondary tranches.
-                // Any subsequent late recovery or dust remains in PendingSecondaryBuffer
-                // and cannot create further tranches beyond MAX_SECONDARY_TRANCHES (100).
-                break;
-            }
 
             let tranche_amount = if pending > MAX_MONETARY_CAP {
                 MAX_MONETARY_CAP
@@ -899,7 +861,7 @@ impl KallpaPoolContract {
 
         // Must reconcile any unallocated external token transfers before closing!
         // This guarantees that any direct SEP-41 transfer or late TW escrow refund is fully recognized.
-        Self::internal_reconcile_surplus(&env, &config, state).unwrap_or(0);
+        Self::internal_reconcile_surplus(&env, &config, state)?;
 
         // Flush any remaining sub-threshold buffer if present
         let pending: i128 = env
@@ -909,29 +871,26 @@ impl KallpaPoolContract {
             .unwrap_or(0);
 
         if pending > 0 {
-            // Materialize remaining buffer into a final tranche if slots remain (count < MAX_SECONDARY_TRANCHES)
             let count: u32 = env
                 .storage()
                 .instance()
                 .get(&DataKey::SecondaryTrancheCount)
                 .unwrap_or(0);
 
-            if count < MAX_SECONDARY_TRANCHES {
-                let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
-                env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
-                let tranche_key = DataKey::SecondaryTranche(new_count);
-                env.storage().persistent().set(&tranche_key, &pending);
-                env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            let new_count = count.checked_add(1).ok_or(Error::CapacityExceeded)?;
+            env.storage().instance().set(&DataKey::SecondaryTrancheCount, &new_count);
+            let tranche_key = DataKey::SecondaryTranche(new_count);
+            env.storage().persistent().set(&tranche_key, &pending);
+            env.storage().persistent().extend_ttl(&tranche_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
-                let total_sec: i128 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::TotalSecondaryAllocated)
-                    .unwrap_or(0);
-                let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
-                env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
-                env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
-            }
+            let total_sec: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalSecondaryAllocated)
+                .unwrap_or(0);
+            let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
+            env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+            env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
         }
 
         env.storage().instance().set(&DataKey::State, &PoolState::Closed);
@@ -1007,14 +966,6 @@ impl KallpaPoolContract {
                 Self::record_secondary_tranche(env, secondary_part)?;
             }
         } else {
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::SecondaryTrancheCount)
-                .unwrap_or(0);
-            if count >= MAX_SECONDARY_TRANCHES {
-                return Err(Error::CapacityExceeded);
-            }
             Self::record_secondary_tranche(env, unallocated_surplus)?;
         }
 
@@ -1042,11 +993,10 @@ impl KallpaPoolContract {
             .get(&DataKey::State)
             .unwrap_or(PoolState::Open);
 
-        if state == PoolState::Closed {
-            return Err(Error::PoolClosed);
-        }
-
-        if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
+        // Claims and balance reconciliations are permitted in Funded, Settled, Disputed, or Closed.
+        // Even if a pool was marked Closed, any late incoming transfer can always be reconciled
+        // and allocated into secondary tranches, guaranteeing zero locked funds under any circumstance.
+        if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed && state != PoolState::Closed {
             return Err(Error::PoolNotFunded);
         }
 

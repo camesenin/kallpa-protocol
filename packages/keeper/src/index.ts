@@ -60,6 +60,7 @@ export interface PendingTxReservation {
   txHash: string;
   committedFeeStroops: bigint;
   timestamp: number;
+  validUntilTime?: number; // UNIX epoch timestamp seconds from tx timeBounds.maxTime
 }
 
 export class KallpaKeeperDaemon {
@@ -85,17 +86,27 @@ export class KallpaKeeperDaemon {
     try {
       if (fs.existsSync(this.storageFile)) {
         const raw = fs.readFileSync(this.storageFile, "utf-8");
-        const list: Array<{ txHash: string; committedFeeStroops: string; timestamp: number }> = JSON.parse(raw);
+        const list: Array<{ txHash: string; committedFeeStroops: string; timestamp: number; validUntilTime?: number }> = JSON.parse(raw);
         for (const item of list) {
           this.pendingReservations.set(item.txHash, {
             txHash: item.txHash,
             committedFeeStroops: BigInt(item.committedFeeStroops),
             timestamp: item.timestamp,
+            validUntilTime: item.validUntilTime,
           });
         }
       }
-    } catch (e) {
-      // In case of corrupt file or read error, fallback to empty in-memory state
+    } catch (e: any) {
+      // In case of corrupt file, back up to preserve forensic state and throw to prevent silent state wipe
+      try {
+        const backupCorrupt = `${this.storageFile}.corrupt.${Date.now()}`;
+        if (fs.existsSync(this.storageFile)) {
+          fs.copyFileSync(this.storageFile, backupCorrupt);
+        }
+      } catch (backupErr) {
+        // Ignore secondary backup error
+      }
+      throw new Error(`Critical: Corrupted keeper storage file detected: ${this.storageFile}. Backed up to preserve reservations: ${e.message}`);
     }
   }
 
@@ -106,6 +117,7 @@ export class KallpaKeeperDaemon {
         txHash: r.txHash,
         committedFeeStroops: r.committedFeeStroops.toString(),
         timestamp: r.timestamp,
+        validUntilTime: r.validUntilTime,
       }));
       const dir = path.dirname(this.storageFile);
       if (dir && !fs.existsSync(dir)) {
@@ -216,6 +228,16 @@ export class KallpaKeeperDaemon {
    */
   public async reconcilePendingReservations(): Promise<void> {
     const now = Date.now();
+    let networkCloseTime: number | null = null;
+    try {
+      const latestLedger = await this.server.getLatestLedger();
+      if (latestLedger && typeof (latestLedger as any).closeTime === "number") {
+        networkCloseTime = (latestLedger as any).closeTime;
+      }
+    } catch (e) {
+      // Fallback if getLatestLedger RPC is unavailable
+    }
+
     let changed = false;
     for (const [txHash, reservation] of Array.from(this.pendingReservations.entries())) {
       try {
@@ -228,7 +250,15 @@ export class KallpaKeeperDaemon {
       } catch (e) {
         // RPC error or not found yet
       }
-      // Prune expired after 10m (well past 30s envelope validity timeout)
+
+      // 1. Ledger-aware expiration: if network close time has passed transaction time bounds
+      if (reservation.validUntilTime && networkCloseTime && networkCloseTime > reservation.validUntilTime) {
+        this.pendingReservations.delete(txHash);
+        changed = true;
+        continue;
+      }
+
+      // 2. Safe timeout prune after 10m (well past 30s envelope validity timeout)
       if (now - reservation.timestamp > 600_000) {
         this.pendingReservations.delete(txHash);
         changed = true;
@@ -712,12 +742,16 @@ export class KallpaKeeperDaemon {
 
       restoreTx.sign(this.sponsorKey);
       const computedRestoreHash = restoreTx.hash().toString("hex");
+      const restoreValidUntilTime = (restoreTx.timeBounds && restoreTx.timeBounds.maxTime)
+        ? Number(restoreTx.timeBounds.maxTime)
+        : undefined;
 
       // WAL: Persist restoration envelope fee BEFORE dispatching to network
       this.pendingReservations.set(computedRestoreHash, {
         txHash: computedRestoreHash,
         committedFeeStroops: definitiveRestoreFee,
         timestamp: Date.now(),
+        validUntilTime: restoreValidUntilTime,
       });
       this.persistDurableReservations();
 
@@ -829,6 +863,9 @@ export class KallpaKeeperDaemon {
 
       preparedTx.sign(this.sponsorKey);
       const computedTxHash = preparedTx.hash().toString("hex");
+      const preparedValidUntilTime = (preparedTx.timeBounds && preparedTx.timeBounds.maxTime)
+        ? Number(preparedTx.timeBounds.maxTime)
+        : undefined;
 
       // WAL (Write-Ahead Logging): Persist reservation BEFORE dispatching to network.
       // This strictly closes the crash window: if the process crashes during or immediately
@@ -837,6 +874,7 @@ export class KallpaKeeperDaemon {
         txHash: computedTxHash,
         committedFeeStroops: definitiveEnvelopeFee,
         timestamp: Date.now(),
+        validUntilTime: preparedValidUntilTime,
       });
       this.persistDurableReservations();
 
