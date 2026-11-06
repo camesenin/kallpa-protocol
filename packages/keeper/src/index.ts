@@ -572,8 +572,10 @@ export class KallpaKeeperDaemon {
       if (eventTranches !== null) {
         receipt.tranchesAdvanced = eventTranches;
       } else {
-        // 2. Strict Zero Attribution: If event not present in confirmed metadata, do NOT attribute phantom tranches!
-        receipt.tranchesAdvanced = 0;
+        // Strict Conservative Subsidy Accounting:
+        // If event metadata is omitted or undecodable in RPC response, conservatively charge the expected batch advancement
+        // against the subsidy quota to strictly prevent unmonetized subsidy leakage or infinite loops.
+        receipt.tranchesAdvanced = expectedAdvancement;
       }
     }
     return receipt;

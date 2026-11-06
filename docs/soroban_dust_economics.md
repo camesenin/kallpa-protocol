@@ -67,13 +67,17 @@ $$\left| \sum_{k=1}^K P_{i,k} - E_i^{ideal} \right| < K \text{ stroops}$$
 
 ---
 
-## 4. Economic Break-Even Viability Matrix & Keeper Subsidies
+## 4. Rigorous Economic Break-Even Viability Model & Keeper Subsidies
 
-For an individual micro-investor with contribution $p$ in a pool of size $T$, self-claiming $K$ tranches of total recovery $A$ is economically viable if the recovered amount exceeds the execution gas cost $C_{gas}$:
+For an individual investor with contribution $p$ in a pool of total capital $T$, reclaiming $K$ tranches of aggregate recovery $A$ requires $\lceil K / 50 \rceil$ separate contract invocations (capped at 50 tranches per transaction). The total execution cost for position $i$ is:
 
-$$\frac{p}{T} A \ge C_{gas}$$
+$C_i = \sum_{j=1}^{\lceil K/50 \rceil} C_{\text{tx},j} + C_{\text{state\_restoration}}$
 
-Crucially, in Soroban, `claim_secondary_recovery(investor, max_tranches)` processes up to 50 tranches **for a single investor**, amortizing transaction gas across those 50 tranches. However, reclaiming across $N$ distinct investors requires $N$ separate contract invocations:
+Self-claiming is economically rational if and only if the gross entitlement exceeds the multi-page claiming cost:
+
+$\frac{p_i}{T} A \ge \sum_{j=1}^{\lceil K/50 \rceil} C_{\text{tx},j} + C_{\text{state\_restoration}}$
+
+Furthermore, completely disbursing $K$ tranches across $N$ distinct investors requires up to $N \times \lceil K / 50 \rceil$ separate transactions. When a micro-recovery is fragmented across numerous tranches, individual self-claiming faces rational abandonment.
 
 | Investor Ticket $p$ | Pool Size $T$ | Pro-Rata Share $\frac{p}{T}$ | Total Recovery $A$ | Gross Recovery Payout | Self-Claim Gas Cost (1 tx) | Net Payout (Self-Claim) | Keeper Disbursed (Zero User Cost) |
 |---|---|---|---|---|---|---|---|
