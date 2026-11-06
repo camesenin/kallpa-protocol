@@ -53,11 +53,18 @@ export interface ClaimExecutionReceipt {
   resultMetaXdr?: any; // Raw or parsed TransactionMeta from RPC response
 }
 
+export interface PendingTxReservation {
+  txHash: string;
+  committedFeeStroops: bigint;
+  timestamp: number;
+}
+
 export class KallpaKeeperDaemon {
   private server: rpc.Server;
   private sponsorKey: Keypair;
   private config: KeeperConfig;
   private isSweepCycleActive: boolean = false;
+  private pendingReservations: Map<string, PendingTxReservation> = new Map();
 
   constructor(config: KeeperConfig) {
     this.config = config;
@@ -140,11 +147,42 @@ export class KallpaKeeperDaemon {
 
     const available = totalBalance > reservedTotal ? totalBalance - reservedTotal : 0n;
 
+    // Deduct unconfirmed pending transaction reservations from available balance
+    let totalPendingReserved = 0n;
+    for (const res of this.pendingReservations.values()) {
+      totalPendingReserved += res.committedFeeStroops;
+    }
+    const netAvailable = available > totalPendingReserved ? available - totalPendingReserved : 0n;
+
     return {
-      solvent: available >= this.config.minSponsorReserveStroops,
+      solvent: netAvailable >= this.config.minSponsorReserveStroops,
       balanceStroops: totalBalance,
-      availableStroops: available,
+      availableStroops: netAvailable,
     };
+  }
+
+  /**
+   * Reconcile any existing pending reservations by querying RPC getTransaction.
+   * If transaction is finalized (SUCCESS or FAILED), the reservation is cleanly released.
+   * If older than 10 minutes (past protocol transaction TTL validity), it is safely pruned.
+   */
+  public async reconcilePendingReservations(): Promise<void> {
+    const now = Date.now();
+    for (const [txHash, reservation] of Array.from(this.pendingReservations.entries())) {
+      try {
+        const res = await this.server.getTransaction(txHash);
+        if (res.status === "SUCCESS" || res.status === "FAILED") {
+          this.pendingReservations.delete(txHash);
+          continue;
+        }
+      } catch (e) {
+        // RPC error or not found yet
+      }
+      // Prune expired after 10m (well past 30s envelope validity timeout)
+      if (now - reservation.timestamp > 600_000) {
+        this.pendingReservations.delete(txHash);
+      }
+    }
   }
 
   /**
@@ -168,6 +206,7 @@ export class KallpaKeeperDaemon {
     }
     this.isSweepCycleActive = true;
     try {
+      await this.reconcilePendingReservations();
       return await this._runSweepCycleInternal(targetsByPool);
     } finally {
       this.isSweepCycleActive = false;
@@ -720,13 +759,23 @@ export class KallpaKeeperDaemon {
         throw new Error(`Transaction submission error: ${sendRes.errorResult?.toXDR("base64")}`);
       }
 
+      // Track pending reservation for in-flight transaction
+      this.pendingReservations.set(sendRes.hash, {
+        txHash: sendRes.hash,
+        committedFeeStroops: definitiveEnvelopeFee,
+        timestamp: Date.now(),
+      });
+
       try {
         txConfirmedResult = await this.waitForConfirmation(sendRes.hash);
         totalCommittedFee += definitiveEnvelopeFee;
         totalEffectiveFee += txConfirmedResult.effectiveFeeCharged;
+        // Cleanly remove from pendingReservations upon confirmed execution
+        this.pendingReservations.delete(sendRes.hash);
       } catch (confirmErr: any) {
         confirmErr.committedFeeStroops = totalCommittedFee + definitiveEnvelopeFee;
         confirmErr.effectiveFeeStroops = totalEffectiveFee + ((confirmErr && typeof confirmErr.effectiveFeeCharged === "bigint") ? confirmErr.effectiveFeeCharged : definitiveEnvelopeFee);
+        // Retain in pendingReservations across timeout so subsequent cycles deduct it
         throw confirmErr;
       }
     } catch (postRestoreFlowErr: any) {

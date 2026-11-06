@@ -988,4 +988,57 @@ describe("@kallpa/keeper", () => {
     // Mismatched contractId returns null
     expect(daemon.extractTranchesAdvancedFromMeta(metaV4, dummyConfig.poolContractIds[0], investor)).toBeNull();
   });
+
+  it("strictly retains pending transaction reservation across timeouts and reconciles on subsequent cycle", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+
+    // Initial solvency check returns 100M stroops
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    // Manually record a pending reservation of 200,000 stroops for txHash "timeoutTx123"
+    (daemon as any).pendingReservations.set("timeoutTx123", {
+      txHash: "timeoutTx123",
+      committedFeeStroops: 200_000n,
+      timestamp: Date.now(),
+    });
+
+    // checkSponsorSolvency now deductions pendingReservations: 80M - 200k = 79.8M
+    // Let's call the actual checkSponsorSolvency implementation
+    // We mock server.getLedgerEntries to return total balance of 100M with base reserve 10M
+    const dummyAccountEntry = {
+      balance: () => ({ toBigInt: () => 100_000_000n }),
+      numSubEntries: () => 0,
+      ext: () => ({ switch: () => 0 }),
+    };
+    (daemon as any).server.getLedgerEntries = async () => ({
+      entries: [{ val: { account: () => dummyAccountEntry } }],
+    });
+
+    // Remove the override so the real checkSponsorSolvency executes
+    delete (daemon as any).checkSponsorSolvency;
+
+    const solvencyBefore = await daemon.checkSponsorSolvency();
+    // Available balance is 100M - 10M (baseReserve) - 200k (pendingReservation) = 89,800,000n
+    expect(solvencyBefore.availableStroops).toBe(89_800_000n);
+
+    // Mock RPC getTransaction to simulate success on reconciliation
+    (daemon as any).server.getTransaction = async (hash: string) => {
+      if (hash === "timeoutTx123") {
+        return { status: "SUCCESS" };
+      }
+      throw new Error("Not found");
+    };
+
+    // Reconcile pending reservations
+    await daemon.reconcilePendingReservations();
+
+    // After reconciliation, reservation is cleared
+    expect((daemon as any).pendingReservations.size).toBe(0);
+    const solvencyAfter = await daemon.checkSponsorSolvency();
+    expect(solvencyAfter.availableStroops).toBe(90_000_000n);
+  });
 });
