@@ -1,4 +1,5 @@
 #![cfg(test)]
+extern crate std;
 
 use super::*;
 use soroban_sdk::{
@@ -1483,7 +1484,7 @@ fn test_metering_and_resource_limits_batches_1_25_50() {
     setup.client.claim_secondary_recovery(&setup.investor1, &Some(1));
     let cpu_1 = setup.env.cost_estimate().budget().cpu_instruction_cost();
     let mem_1 = setup.env.cost_estimate().budget().memory_bytes_cost();
-    // metric 1
+    std::println!("METERING BATCH 1: CPU={}, MEM={}", cpu_1, mem_1);
     assert!(cpu_1 < 25_000_000, "CPU for batch 1 must be well below Soroban 100M limit");
     assert!(mem_1 < 10_000_000, "Mem for batch 1 must be well below Soroban 40MB limit");
 
@@ -1492,7 +1493,7 @@ fn test_metering_and_resource_limits_batches_1_25_50() {
     setup.client.claim_secondary_recovery(&setup.investor1, &Some(25));
     let cpu_25 = setup.env.cost_estimate().budget().cpu_instruction_cost();
     let mem_25 = setup.env.cost_estimate().budget().memory_bytes_cost();
-    // metric 25
+    std::println!("METERING BATCH 25: CPU={}, MEM={}", cpu_25, mem_25);
     assert!(cpu_25 < 40_000_000, "CPU for batch 25 must be well below Soroban 100M limit");
     assert!(mem_25 < 15_000_000, "Mem for batch 25 must be well below Soroban 40MB limit");
 
@@ -1501,7 +1502,7 @@ fn test_metering_and_resource_limits_batches_1_25_50() {
     setup.client.claim_secondary_recovery(&setup.investor1, &Some(50));
     let cpu_50 = setup.env.cost_estimate().budget().cpu_instruction_cost();
     let mem_50 = setup.env.cost_estimate().budget().memory_bytes_cost();
-    // metric 50
+    std::println!("METERING BATCH 50: CPU={}, MEM={}", cpu_50, mem_50);
     assert!(cpu_50 < 80_000_000, "CPU for batch 50 must be well below Soroban 100M limit");
     assert!(mem_50 < 30_000_000, "Mem for batch 50 must be well below Soroban 40MB limit");
 
