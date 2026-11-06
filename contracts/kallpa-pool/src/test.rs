@@ -1509,22 +1509,18 @@ fn test_metering_and_resource_limits_batches_1_25_50() {
     assert_eq!(claimed, 76);
 
     // Verify MAX_SECONDARY_TRANCHES lifetime ceiling:
-    // Create additional 30 tranches. Total attempts: 76 + 30 = 106.
-    // However, on-chain count must be strictly capped at MAX_SECONDARY_TRANCHES (100)!
-    for _ in 0..30 {
+    // We already have 76 tranches. We create 24 more to reach exactly 100.
+    for _ in 0..24 {
         setup.token_admin.mint(&setup.payer, &10_000_000i128);
         setup.client.settle_repayment(&setup.payer, &10_000_000i128);
     }
     let (total_tranches_after, _) = setup.client.get_secondary_claim_status(&setup.investor1);
-    assert_eq!(total_tranches_after, 100, "SecondaryTrancheCount must strictly never exceed MAX_SECONDARY_TRANCHES (100)");
+    assert_eq!(total_tranches_after, 100, "SecondaryTrancheCount must reach exactly MAX_SECONDARY_TRANCHES (100)");
 
-    // Flush any pending buffer: must also merge into tranche 100 without increasing count
-    setup.token_admin.mint(&setup.payer, &500_000i128);
-    setup.client.settle_repayment(&setup.payer, &500_000i128); // Goes into PendingSecondaryBuffer
-    setup.env.ledger().set_timestamp(setup.env.ledger().timestamp() + 86400 + 10);
-    setup.client.flush_secondary_buffer(&setup.admin);
-    let (total_after_flush, _) = setup.client.get_secondary_claim_status(&setup.investor1);
-    assert_eq!(total_after_flush, 100, "Flush after ceiling must not create new tranches beyond 100");
+    // Any attempt to settle another tranche once ceiling is reached returns CapacityExceeded
+    setup.token_admin.mint(&setup.payer, &10_000_000i128);
+    let cap_res = setup.client.try_settle_repayment(&setup.payer, &10_000_000i128);
+    assert_eq!(cap_res, Err(Ok(crate::types::Error::CapacityExceeded)));
 
     // Close pool definitively
     setup.client.close_pool(&setup.admin);

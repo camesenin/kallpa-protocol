@@ -305,6 +305,14 @@ impl KallpaPoolContract {
         // If pool is already Settled or Disputed, any post-settlement repayment or late recovery
         // routes to a discrete immutable secondary tranche without altering frozen primary R.
         if state == PoolState::Settled || state == PoolState::Disputed {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+            if count >= MAX_SECONDARY_TRANCHES {
+                return Err(Error::CapacityExceeded);
+            }
             token_client.transfer(&payer, &env.current_contract_address(), &amount);
             Self::record_secondary_tranche(&env, amount)?;
             env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -461,6 +469,14 @@ impl KallpaPoolContract {
             }
         } else {
             // Already Settled or Disputed: late dispute refund routes to discrete secondary tranche
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+            if count >= MAX_SECONDARY_TRANCHES {
+                return Err(Error::CapacityExceeded);
+            }
             Self::record_secondary_tranche(&env, amount)?;
         }
 
@@ -1012,6 +1028,14 @@ impl KallpaPoolContract {
                 Self::record_secondary_tranche(&env, secondary_part)?;
             }
         } else {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::SecondaryTrancheCount)
+                .unwrap_or(0);
+            if count >= MAX_SECONDARY_TRANCHES {
+                return Err(Error::CapacityExceeded);
+            }
             Self::record_secondary_tranche(&env, unallocated_surplus)?;
         }
 
