@@ -73,9 +73,9 @@ For an individual investor with contribution $p$ in a pool of total capital $T$,
 
 $C_i = \sum_{j=1}^{\lceil K/50 \rceil} C_{\text{tx},j} + C_{\text{state\_restoration}}$
 
-Self-claiming is economically rational if and only if the gross entitlement exceeds the multi-page claiming cost:
+Self-claiming is economically rational if and only if the discrete integer entitlement $Q_i = \sum_{k=1}^K P_{i,k}$ exceeds the multi-page claiming cost:
 
-$\frac{p_i}{T} A \ge \sum_{j=1}^{\lceil K/50 \rceil} C_{\text{tx},j} + C_{\text{state\_restoration}}$
+$Q_i = \sum_{k=1}^K \left( \left\lfloor \frac{c_i S_k}{T} \right\rfloor - \left\lfloor \frac{c_{i-1} S_k}{T} \right\rfloor \right) \ge \sum_{j=1}^{\lceil K/50 \rceil} C_{\text{tx},j} + C_{\text{state\_restoration}}$
 
 Furthermore, completely disbursing $K$ tranches across $N$ distinct investors requires up to $N \times \lceil K / 50 \rceil$ separate transactions. When a micro-recovery is fragmented across numerous tranches, individual self-claiming faces rational abandonment.
 
