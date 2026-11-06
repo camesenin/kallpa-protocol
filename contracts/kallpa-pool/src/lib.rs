@@ -417,14 +417,12 @@ impl KallpaPoolContract {
             return Err(Error::PoolNotFunded);
         }
 
-        if amount < 0 || amount > MAX_MONETARY_CAP {
+        if amount <= 0 || amount > MAX_MONETARY_CAP {
             return Err(Error::InvalidAmount);
         }
 
-        if amount > 0 {
-            let token_client = token::Client::new(&env, &config.asset);
-            token_client.transfer(&caller, &env.current_contract_address(), &amount);
-        }
+        let token_client = token::Client::new(&env, &config.asset);
+        token_client.transfer(&caller, &env.current_contract_address(), &amount);
 
         if state == PoolState::Funded {
             let total_repaid: i128 = env

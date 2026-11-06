@@ -31,6 +31,7 @@ export enum PoolState {
   Settled = 2,
   Refundable = 3,
   Disputed = 4,
+  Closed = 5,
 }
 
 /**
