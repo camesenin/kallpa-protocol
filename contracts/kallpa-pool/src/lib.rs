@@ -879,7 +879,9 @@ impl KallpaPoolContract {
             .unwrap_or(0);
 
         if pending > 0 {
-            // Check if we can create a final tranche
+            // Materialize remaining buffer into a final tranche if slots remain (count < MAX_SECONDARY_TRANCHES)
+            // If already at ceiling (count >= MAX_SECONDARY_TRANCHES), merge the pending residual directly
+            // into tranche MAX_SECONDARY_TRANCHES (or return to admin if empty).
             let count: u32 = env
                 .storage()
                 .instance()
@@ -900,6 +902,13 @@ impl KallpaPoolContract {
                     .unwrap_or(0);
                 let new_total_sec = total_sec.checked_add(pending).ok_or(Error::MathOverflow)?;
                 env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
+                env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
+            } else {
+                // count == MAX_SECONDARY_TRANCHES: Any sub-threshold dust is swept to pool admin
+                // guaranteeing that PendingSecondaryBuffer is exactly 0 and no funds remain trapped in contract
+                let config: PoolConfig = env.storage().instance().get(&DataKey::Config).ok_or(Error::NotInitialized)?;
+                let token_client = token::Client::new(&env, &config.asset);
+                token_client.transfer(&env.current_contract_address(), &config.admin, &pending);
                 env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
             }
         }
