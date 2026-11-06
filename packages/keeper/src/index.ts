@@ -111,9 +111,12 @@ export class KallpaKeeperDaemon {
       if (dir && !fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(this.storageFile, JSON.stringify(list, null, 2), "utf-8");
-    } catch (e) {
-      // Non-fatal write warning
+      const tmpFile = `${this.storageFile}.tmp.${Date.now()}`;
+      fs.writeFileSync(tmpFile, JSON.stringify(list, null, 2), "utf-8");
+      // Atomic rename guarantees crash-proof durable storage
+      fs.renameSync(tmpFile, this.storageFile);
+    } catch (e: any) {
+      throw new Error(`Critical: Failed to persist durable keeper reservations: ${e.message}`);
     }
   }
 
@@ -708,6 +711,16 @@ export class KallpaKeeperDaemon {
       }
 
       restoreTx.sign(this.sponsorKey);
+      const computedRestoreHash = restoreTx.hash().toString("hex");
+
+      // WAL: Persist restoration envelope fee BEFORE dispatching to network
+      this.pendingReservations.set(computedRestoreHash, {
+        txHash: computedRestoreHash,
+        committedFeeStroops: definitiveRestoreFee,
+        timestamp: Date.now(),
+      });
+      this.persistDurableReservations();
+
       let restoreSendRes: rpc.Api.SendTransactionResponse;
       try {
         restoreSendRes = await this.server.sendTransaction(restoreTx);
@@ -717,19 +730,36 @@ export class KallpaKeeperDaemon {
         throw transportErr;
       }
       if (restoreSendRes.status === "ERROR") {
+        this.pendingReservations.delete(computedRestoreHash);
+        this.persistDurableReservations();
         throw new Error(`Restore footprint failed: ${restoreSendRes.errorResult?.toXDR("base64")}`);
       }
 
+      if (restoreSendRes.hash && restoreSendRes.hash !== computedRestoreHash) {
+        this.pendingReservations.delete(computedRestoreHash);
+        this.pendingReservations.set(restoreSendRes.hash, {
+          txHash: restoreSendRes.hash,
+          committedFeeStroops: definitiveRestoreFee,
+          timestamp: Date.now(),
+        });
+        this.persistDurableReservations();
+      }
+
+      const activeRestoreHash = restoreSendRes.hash || computedRestoreHash;
+
       try {
-        const restoreTxMeta = await this.waitForConfirmation(restoreSendRes.hash);
+        const restoreTxMeta = await this.waitForConfirmation(activeRestoreHash);
         totalCommittedFee += definitiveRestoreFee;
         totalEffectiveFee += restoreTxMeta.effectiveFeeCharged;
+        this.pendingReservations.delete(activeRestoreHash);
+        this.persistDurableReservations();
       } catch (err: any) {
         // Track committed fee on failure:
-        // Always preserve the 200k maximum committed envelope fee for cycle budget safety,
+        // Always preserve the maximum committed envelope fee for cycle budget safety,
         // but record the EXACT effective fee charged if extracted from FAILED transaction resultXdr!
         err.committedFeeStroops = definitiveRestoreFee;
         err.effectiveFeeStroops = (err && typeof err.effectiveFeeCharged === "bigint") ? err.effectiveFeeCharged : definitiveRestoreFee;
+        this.persistDurableReservations();
         throw err;
       }
 

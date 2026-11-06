@@ -875,6 +875,16 @@ impl KallpaPoolContract {
     /// and bounds the lifetime tranche creation horizon once and for all.
     /// All participants retain 100% permissionless access to claim their existing entitled tranches.
     pub fn close_pool(env: Env, caller: Address) -> Result<(), Error> {
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        // Only admin can finalize and close the pool
+        if caller != config.admin {
+            return Err(Error::Unauthorized);
+        }
         caller.require_auth();
 
         let state: PoolState = env
@@ -886,6 +896,10 @@ impl KallpaPoolContract {
         if state != PoolState::Settled && state != PoolState::Disputed {
             return Err(Error::PoolNotSettled);
         }
+
+        // Must reconcile any unallocated external token transfers before closing!
+        // This guarantees that any direct SEP-41 transfer or late TW escrow refund is fully recognized.
+        Self::internal_reconcile_surplus(&env, &config, state).unwrap_or(0);
 
         // Flush any remaining sub-threshold buffer if present
         let pending: i128 = env
@@ -918,8 +932,6 @@ impl KallpaPoolContract {
                 env.storage().instance().set(&DataKey::TotalSecondaryAllocated, &new_total_sec);
                 env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &0i128);
             }
-            // Note: If count == MAX_SECONDARY_TRANCHES, no new tranche is created and previous
-            // tranches are NOT modified, preserving absolute immutability and monotonicity of claimed_tranches.
         }
 
         env.storage().instance().set(&DataKey::State, &PoolState::Closed);
@@ -927,42 +939,9 @@ impl KallpaPoolContract {
         Ok(())
     }
 
-    /// Autonomous onchain reconciliation of funds returned directly by Trustless Work or external escrow.
-    /// Eliminates reliance on active admin approval or second token transfers:
-    /// Any participant can call this function to inspect the contract's actual token balance,
-    /// compute any unrecorded surplus above RecognizedBalance, and cleanly record it
-    /// into primary TotalRepaid (transitioning Funded -> Disputed) or into discrete secondary tranches.
-    pub fn reconcile_incoming_balance(env: Env, caller: Address) -> Result<i128, Error> {
-        caller.require_auth();
-
-        let config: PoolConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(Error::NotInitialized)?;
-
-        let state: PoolState = env
-            .storage()
-            .instance()
-            .get(&DataKey::State)
-            .unwrap_or(PoolState::Open);
-
-        if state == PoolState::Closed {
-            return Err(Error::PoolClosed);
-        }
-
-        if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
-            return Err(Error::PoolNotFunded);
-        }
-
-        let now = env.ledger().timestamp();
-        // In Funded state, external reconcile can ONLY be triggered by authenticated tw_escrow/admin,
-        // or permissionlessly strictly AFTER repayment_deadline has elapsed (default/dispute window)
-        if state == PoolState::Funded && caller != config.tw_escrow && caller != config.admin && now <= config.repayment_deadline {
-            return Err(Error::Unauthorized);
-        }
-
-        let token_client = token::Client::new(&env, &config.asset);
+    /// Internal unauthenticated helper to reconcile surplus token balance without triggering auth errors
+    fn internal_reconcile_surplus(env: &Env, config: &PoolConfig, state: PoolState) -> Result<i128, Error> {
+        let token_client = token::Client::new(env, &config.asset);
         let actual_balance = token_client.balance(&env.current_contract_address());
 
         // Invariant-based unallocated surplus calculation:
@@ -1025,7 +1004,7 @@ impl KallpaPoolContract {
             env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
 
             if secondary_part > 0 {
-                Self::record_secondary_tranche(&env, secondary_part)?;
+                Self::record_secondary_tranche(env, secondary_part)?;
             }
         } else {
             let count: u32 = env
@@ -1036,11 +1015,49 @@ impl KallpaPoolContract {
             if count >= MAX_SECONDARY_TRANCHES {
                 return Err(Error::CapacityExceeded);
             }
-            Self::record_secondary_tranche(&env, unallocated_surplus)?;
+            Self::record_secondary_tranche(env, unallocated_surplus)?;
         }
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(unallocated_surplus)
+    }
+
+    /// Autonomous onchain reconciliation of funds returned directly by Trustless Work or external escrow.
+    /// Eliminates reliance on active admin approval or second token transfers:
+    /// Any participant can call this function to inspect the contract's actual token balance,
+    /// compute any unrecorded surplus above RecognizedBalance, and cleanly record it
+    /// into primary TotalRepaid (transitioning Funded -> Disputed) or into discrete secondary tranches.
+    pub fn reconcile_incoming_balance(env: Env, caller: Address) -> Result<i128, Error> {
+        caller.require_auth();
+
+        let config: PoolConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        let state: PoolState = env
+            .storage()
+            .instance()
+            .get(&DataKey::State)
+            .unwrap_or(PoolState::Open);
+
+        if state == PoolState::Closed {
+            return Err(Error::PoolClosed);
+        }
+
+        if state != PoolState::Funded && state != PoolState::Settled && state != PoolState::Disputed {
+            return Err(Error::PoolNotFunded);
+        }
+
+        let now = env.ledger().timestamp();
+        // In Funded state, external reconcile can ONLY be triggered by authenticated tw_escrow/admin,
+        // or permissionlessly strictly AFTER repayment_deadline has elapsed (default/dispute window)
+        if state == PoolState::Funded && caller != config.tw_escrow && caller != config.admin && now <= config.repayment_deadline {
+            return Err(Error::Unauthorized);
+        }
+
+        Self::internal_reconcile_surplus(&env, &config, state)
     }
 
 pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Error> {
