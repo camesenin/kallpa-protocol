@@ -387,7 +387,16 @@ export class KallpaKeeperDaemon {
       remainingBudget
     );
     if (receipt.txHash !== null) {
-      receipt.tranchesAdvanced = expectedAdvancement;
+      // Reconcile exact on-chain advancement by querying state after execution
+      try {
+        const statusAfter = await this.getSecondaryClaimStatus(poolContract, scValInvestor);
+        const actualAdvanced = statusAfter.claimed > statusBefore.claimed
+          ? (statusAfter.claimed - statusBefore.claimed)
+          : expectedAdvancement;
+        receipt.tranchesAdvanced = actualAdvanced;
+      } catch (e) {
+        receipt.tranchesAdvanced = expectedAdvancement;
+      }
     }
     return receipt;
   }

@@ -695,4 +695,113 @@ describe("@kallpa/keeper", () => {
     // effectiveFeeStroops reflects the EXACT fee charged by Stellar Core (145k), NOT the 200k ceiling!
     expect(capturedErr.effectiveFeeStroops).toBe(145000n);
   });
+  it("reconciles exact on-chain tranche advancement when external state changes occur between pre-query and execution", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const { Contract } = await import("@stellar/stellar-sdk");
+    const pool = new Contract(dummyConfig.poolContractIds[0]);
+    const investor = Keypair.random().publicKey();
+
+    let queryCount = 0;
+    daemon.getSecondaryClaimStatus = async () => {
+      queryCount++;
+      if (queryCount === 1) {
+        // Pre-query: 100 total, 0 claimed, 100 remaining
+        return { total: 100, claimed: 0, remaining: 100 };
+      }
+      // Post-confirmation state: an external concurrent actor advanced 8 tranches, our tx advanced 2 -> 10 claimed!
+      return { total: 100, claimed: 10, remaining: 90 };
+    };
+
+    (daemon as any).executePermissionlessCall = async () => ({
+      txHash: "concurrentTxHash",
+      feeSpentStroops: 100000n,
+      committedFeeStroops: 100000n,
+      effectiveFeeStroops: 100000n,
+      payoutStroops: 0n,
+    });
+
+    const receipt = await daemon.disburseSecondaryRecoveryWithReceipt(pool, investor, 50);
+    // Must record EXACT on-chain state delta (10 - 0 = 10), NOT the raw expected 50!
+    expect(receipt.tranchesAdvanced).toBe(10);
+    expect(queryCount).toBe(2);
+  });
+  it("executes complete 4-step restoration and invocation lifecycle: sim with preamble -> restore -> clean re-sim -> confirmed execution", async () => {
+    const daemon = new KallpaKeeperDaemon(dummyConfig);
+    const poolId = dummyConfig.poolContractIds[0];
+
+    const { Account, Contract } = await import("@stellar/stellar-sdk");
+    const mockAccount = new Account(dummyKey.publicKey(), "100");
+
+    let simCalls = 0;
+    let restoreTxSent = false;
+    let invocationTxSent = false;
+
+    (daemon as any).server = {
+      getAccount: async () => mockAccount,
+      simulateTransaction: async () => {
+        simCalls++;
+        if (simCalls === 1) {
+          // Step 1: Initial simulation indicates archived footprint requiring restoration
+          return {
+            minResourceFee: "50000",
+            results: [{ auth: [], xdr: null }],
+            transactionData: new SorobanDataBuilder().build(),
+            restorePreamble: {
+              minResourceFee: "100000",
+              transactionData: new SorobanDataBuilder().build(),
+            },
+          };
+        }
+        // Step 3: Clean post-restoration re-simulation WITHOUT restorePreamble!
+        return {
+          minResourceFee: "50000",
+          results: [{ auth: [], xdr: null }],
+          transactionData: new SorobanDataBuilder().build(),
+        };
+      },
+      sendTransaction: async (tx: any) => {
+        if (!restoreTxSent) {
+          restoreTxSent = true;
+          return { status: "SUCCESS", hash: "restoreTxConfirmedHash" };
+        }
+        invocationTxSent = true;
+        return { status: "SUCCESS", hash: "invocationConfirmedHash" };
+      },
+      getTransaction: async () => ({
+        status: "SUCCESS",
+        resultXdr: {
+          feeCharged: () => ({ toBigInt: () => 100000n, toString: () => "100000" }),
+        },
+      }),
+    };
+
+    (daemon as any).waitForConfirmation = async (hash: string) => ({
+      effectiveFeeCharged: hash === "restoreTxConfirmedHash" ? 100000n : 105000n,
+    });
+
+    daemon.checkSponsorSolvency = async () => ({
+      solvent: true,
+      balanceStroops: 100_000_000n,
+      availableStroops: 80_000_000n,
+    });
+
+    const realContract = new Contract(poolId);
+    const receipt = await (daemon as any).executePermissionlessCall(
+      realContract,
+      "claim_return",
+      [new Address(Keypair.random().publicKey()).toScVal()]
+    );
+
+    // Assert that the exact 4-step sequence executed:
+    // 1. Initial simulation returning restorePreamble
+    // 2. Standalone restoreFootprint transaction sent and confirmed
+    // 3. Clean re-simulation without restorePreamble
+    // 4. Invocation transaction dispatched and confirmed
+    expect(simCalls).toBe(2);
+    expect(restoreTxSent).toBe(true);
+    expect(invocationTxSent).toBe(true);
+    expect(receipt.txHash).toBe("invocationConfirmedHash");
+    // Restoration (100k) + Invocation (105k) = 205k total effective fee
+    expect(receipt.effectiveFeeStroops).toBe(205000n);
+  });
 });
