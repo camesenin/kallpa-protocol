@@ -35,9 +35,9 @@ pub struct KallpaPoolContract;
 
 #[contractimpl]
 impl KallpaPoolContract {
-    fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Ok(());
+    fn record_secondary_tranche_budgeted(env: &Env, amount: i128, max_tranches: u32) -> Result<u32, Error> {
+        if amount <= 0 || max_tranches == 0 {
+            return Ok(0);
         }
 
         // Pull any existing pending buffer
@@ -52,15 +52,15 @@ impl KallpaPoolContract {
         if combined < MIN_RECOVERY_TRANCHE {
             // Below threshold: accumulate in buffer without failing or reverting repayment
             env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &combined);
-            return Ok(());
+            return Ok(0);
         }
 
         // Materialize discrete tranches strictly capped at MAX_MONETARY_CAP per tranche
-        // and bounded by MAX_TRANCHES_PER_TX to guarantee strict resource metering per transaction.
+        // and bounded by max_tranches budget to guarantee strict resource metering per transaction.
         // Tranche keys are unbounded in persistent storage: every late repayment or external
         // surplus is guaranteed to materialize without ceiling rejection, preventing trapped funds.
         let mut tranches_created = 0u32;
-        while combined >= MIN_RECOVERY_TRANCHE && tranches_created < MAX_TRANCHES_PER_TX {
+        while combined >= MIN_RECOVERY_TRANCHE && tranches_created < max_tranches {
             let count: u32 = env
                 .storage()
                 .instance()
@@ -93,6 +93,11 @@ impl KallpaPoolContract {
 
         // Remaining unmaterialized balance safely stays in PendingSecondaryBuffer
         env.storage().instance().set(&DataKey::PendingSecondaryBuffer, &combined);
+        Ok(tranches_created)
+    }
+
+    fn record_secondary_tranche(env: &Env, amount: i128) -> Result<(), Error> {
+        Self::record_secondary_tranche_budgeted(env, amount, MAX_TRANCHES_PER_TX)?;
         Ok(())
     }
 
@@ -865,13 +870,14 @@ impl KallpaPoolContract {
 
         // Must reconcile any unallocated external token transfers before closing!
         // This guarantees that any direct SEP-41 transfer or late TW escrow refund is fully recognized.
-        Self::internal_reconcile_surplus(&env, &config, state)?;
+        // We share a strict global budget of MAX_TRANCHES_PER_TX (10) across reconciliation and buffer flushing!
+        let (_, tranches_reconciled) = Self::internal_reconcile_surplus(&env, &config, state, MAX_TRANCHES_PER_TX)?;
 
-        // Materialize buffer incrementally strictly bounded by MAX_TRANCHES_PER_TX (10) per invocation!
-        // This guarantees that close_pool() is strictly bounded in CPU and memory metering.
-        // If pending balance exceeds 10 slices, close_pool materializes the first 10 slices,
-        // records remaining balance in PendingSecondaryBuffer, and caller must invoke close_pool again.
-        // The pool transitions to Closed ONLY once pending balance is completely materialized to 0!
+        let remaining_budget = MAX_TRANCHES_PER_TX.saturating_sub(tranches_reconciled);
+
+        // Materialize buffer incrementally strictly bounded by remaining_budget!
+        // This guarantees that close_pool() NEVER creates more than MAX_TRANCHES_PER_TX (10)
+        // tranches in a single invocation across BOTH reconciliation and buffer flushing combined.
         let mut pending: i128 = env
             .storage()
             .instance()
@@ -879,7 +885,7 @@ impl KallpaPoolContract {
             .unwrap_or(0);
 
         let mut tranches_created = 0u32;
-        while pending > 0 && tranches_created < MAX_TRANCHES_PER_TX {
+        while pending > 0 && tranches_created < remaining_budget {
             let count: u32 = env
                 .storage()
                 .instance()
@@ -920,8 +926,9 @@ impl KallpaPoolContract {
         Ok(())
     }
 
-    /// Internal unauthenticated helper to reconcile surplus token balance without triggering auth errors
-    fn internal_reconcile_surplus(env: &Env, config: &PoolConfig, state: PoolState) -> Result<i128, Error> {
+    /// Internal unauthenticated helper to reconcile surplus token balance without triggering auth errors.
+    /// Returns (unallocated_surplus, tranches_created).
+    fn internal_reconcile_surplus(env: &Env, config: &PoolConfig, state: PoolState, max_tranches: u32) -> Result<(i128, u32), Error> {
         let token_client = token::Client::new(env, &config.asset);
         let actual_balance = token_client.balance(&env.current_contract_address());
 
@@ -976,9 +983,10 @@ impl KallpaPoolContract {
 
         let unallocated_surplus = actual_balance.checked_sub(total_allocated_held).ok_or(Error::MathOverflow)?;
         if unallocated_surplus == 0 {
-            return Ok(0);
+            return Ok((0, 0));
         }
 
+        let mut tranches_created = 0u32;
         if state == PoolState::Funded {
             let remaining_obligation = config
                 .repayment_target
@@ -996,14 +1004,14 @@ impl KallpaPoolContract {
             env.storage().instance().set(&DataKey::State, &PoolState::Disputed);
 
             if secondary_part > 0 {
-                Self::record_secondary_tranche(env, secondary_part)?;
+                tranches_created = Self::record_secondary_tranche_budgeted(env, secondary_part, max_tranches)?;
             }
         } else {
-            Self::record_secondary_tranche(env, unallocated_surplus)?;
+            tranches_created = Self::record_secondary_tranche_budgeted(env, unallocated_surplus, max_tranches)?;
         }
 
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-        Ok(unallocated_surplus)
+        Ok((unallocated_surplus, tranches_created))
     }
 
     /// Autonomous onchain reconciliation of funds returned directly by Trustless Work or external escrow.
@@ -1040,7 +1048,8 @@ impl KallpaPoolContract {
             return Err(Error::Unauthorized);
         }
 
-        Self::internal_reconcile_surplus(&env, &config, state)
+        let (surplus, _) = Self::internal_reconcile_surplus(&env, &config, state, MAX_TRANCHES_PER_TX)?;
+        Ok(surplus)
     }
 
 pub fn get_pool_info(env: Env) -> Result<(PoolConfig, PoolState, i128, i128), Error> {

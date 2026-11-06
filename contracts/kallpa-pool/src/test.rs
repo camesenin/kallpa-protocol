@@ -1579,24 +1579,31 @@ fn test_close_pool_bounded_slices_prevent_overflow_under_extreme_monetary_cap() 
     let pri_claimed = setup.client.claim_return(&setup.investor1);
     assert_eq!(pri_claimed, target);
 
-    // Inflow: 12 x 10^19 stroops deposited directly to contract address
+    // Inflow: 12 x 10^19 stroops deposited directly to contract address WITHOUT prior manual reconciliation!
+    // This directly tests the combined reconciliation + buffer flushing budget inside close_pool.
     let direct_inflow = 12 * target;
     setup.token_admin.mint(&setup.contract_id, &direct_inflow);
 
-    // Reconcile incoming balance: materializes MAX_TRANCHES_PER_TX (10) slices of 10^19,
-    // leaving exactly 2 x 10^19 stroops in PendingSecondaryBuffer
-    let reconciled = setup.client.reconcile_incoming_balance(&setup.investor1);
-    assert_eq!(reconciled, direct_inflow);
-
-    let (tranches_reconciled, _) = setup.client.get_secondary_claim_status(&setup.investor1);
-    assert_eq!(tranches_reconciled, 10);
-
-    // Now execute close_pool(): MUST NOT create a single massive tranche of 2 * 10^19!
-    // It must slice the buffer into bounded tranches of <= MAX_MONETARY_CAP (10^19),
-    // producing tranches 11 and 12, each of 10^19 stroops.
+    // Call 1: close_pool executed with 12 x 10^19 unallocated balance.
+    // internal_reconcile_surplus consumes the entire budget of MAX_TRANCHES_PER_TX (10),
+    // creating exactly 10 tranches and leaving 2 x 10^19 in PendingSecondaryBuffer.
+    // Because remaining_budget is 0, close_pool materializes 0 further tranches,
+    // sees pending > 0, and DOES NOT transition state to Closed!
     setup.client.close_pool(&setup.admin);
-    let (tranches_after_close, _) = setup.client.get_secondary_claim_status(&setup.investor1);
-    assert_eq!(tranches_after_close, 12, "close_pool must slice buffer into 2 bounded tranches without exceeding MAX_MONETARY_CAP");
+    let (tranches_call1, _) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(tranches_call1, 10, "Call 1 must strictly create exactly MAX_TRANCHES_PER_TX (10) tranches combined");
+    let (_, state1, _, _) = setup.client.get_pool_info();
+    assert_eq!(state1, crate::types::PoolState::Settled, "Pool must remain in Settled because 2 x 10^19 remains in buffer!");
+
+    // Call 2: close_pool executed again.
+    // Surplus is now 0 (already recognized in buffer), so internal_reconcile_surplus uses 0 budget.
+    // The buffer flusher uses remaining_budget (10) to materialize the remaining 2 tranches of 10^19.
+    // Buffer becomes 0 (pending == 0) and pool cleanly seals into Closed state!
+    setup.client.close_pool(&setup.admin);
+    let (tranches_call2, _) = setup.client.get_secondary_claim_status(&setup.investor1);
+    assert_eq!(tranches_call2, 12, "Call 2 materializes final 2 tranches for a total of 12 tranches");
+    let (_, state2, _, _) = setup.client.get_pool_info();
+    assert_eq!(state2, crate::types::PoolState::Closed, "Pool must transition to Closed once pending buffer reaches 0");
 
     // Investor claims all 12 secondary tranches in batches:
     // With proper bounded slices (each tranche <= 10^19), intermediate multiplication:
