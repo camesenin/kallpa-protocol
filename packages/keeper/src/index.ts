@@ -777,11 +777,17 @@ export class KallpaKeeperDaemon {
           events = sorobanMeta.events();
         }
       } else if (arm === "v4" || switchVal === 4) {
-        events = meta.v4().events();
-        if (!events || events.length === 0) {
-          const sorobanMeta = meta.v4().sorobanMeta();
-          if (sorobanMeta && typeof sorobanMeta.events === "function") {
-            events = sorobanMeta.events();
+        // In TransactionMetaV4, contract events are strictly located in operations[].events (OperationMetaV2)
+        const ops = meta.v4().operations();
+        if (ops && ops.length > 0) {
+          events = [];
+          for (const op of ops) {
+            if (op && typeof op.events === "function") {
+              const opEvents = op.events();
+              if (opEvents && opEvents.length > 0) {
+                events.push(...opEvents);
+              }
+            }
           }
         }
       }

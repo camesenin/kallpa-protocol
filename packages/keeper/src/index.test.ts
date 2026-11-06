@@ -962,13 +962,19 @@ describe("@kallpa/keeper", () => {
       body: body,
     });
 
+    const opMeta = new xdr.OperationMetaV2({
+      ext: new xdr.ExtensionPoint(0),
+      changes: [],
+      events: [matchingEvent, dummyEvent],
+    });
+
     const metaV4 = new xdr.TransactionMeta(4, new xdr.TransactionMetaV4({
       ext: new xdr.ExtensionPoint(0),
       txChangesBefore: [],
-      operations: [],
+      operations: [opMeta],
       txChangesAfter: [],
       sorobanMeta: null,
-      events: [matchingEvent, dummyEvent],
+      events: [],
       diagnosticEvents: [],
     }));
 
