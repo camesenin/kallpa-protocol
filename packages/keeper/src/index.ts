@@ -158,8 +158,8 @@ export class KallpaKeeperDaemon {
   /**
    * Helper to parse integer/i128 amount from an ScVal
    */
-  private parseScValAmount(val: xdr.ScVal | undefined): bigint {
-    if (!val) return 0n;
+  private parseScValAmount(val: xdr.ScVal | undefined): bigint | null {
+    if (!val) return null;
     try {
       const sw = val.switch().value;
       if (sw === xdr.ScValType.scvI128().value) {
@@ -176,9 +176,9 @@ export class KallpaKeeperDaemon {
         return val.u64().toBigInt();
       }
     } catch (e) {
-      // Fallback
+      // Error decoding ScVal
     }
-    return 0n;
+    return null;
   }
 
   /**
@@ -662,6 +662,7 @@ export class KallpaKeeperDaemon {
       const simRes = await this.server.simulateTransaction(tx);
       if (simRes.result && simRes.result.retval) {
         const payout = this.parseScValAmount(simRes.result.retval);
+        if (payout === null) return ClaimPayoutType.Unknown;
         return payout === 0n ? ClaimPayoutType.Zero : ClaimPayoutType.Positive;
       }
     } catch (e) {
@@ -985,7 +986,7 @@ export class KallpaKeeperDaemon {
       throw postRestoreFlowErr;
     }
 
-    const confirmedPayout = this.parseScValAmount(txConfirmedResult.returnValue);
+    const confirmedPayout = this.parseScValAmount(txConfirmedResult.returnValue) ?? 0n;
 
     return {
       txHash: sendRes.hash,
